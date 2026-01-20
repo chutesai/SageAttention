@@ -114,21 +114,59 @@ if not SKIP_CUDA_BUILD:
         cutlass_dir / "tools" / "util" / "include",
     ]
 
-    ext_modules.append(
-        CUDAExtension(
-            name="fp4attn_cuda",
-            sources=["sageattn3/blackwell/api.cu"],
-            extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
-                "nvcc": append_nvcc_threads(
-                    nvcc_flags + ["-DEXECMODE=0"] + cc_flag
-                ),
-            },
-            include_dirs=include_dirs,
-            # Without this we get and error about cuTensorMapEncodeTiled not defined
-            libraries=["cuda"]
+    # Determine which attention kernel to build based on GPU architecture
+    if (cc_major, cc_minor) == (10, 0):
+        # SM100 (B200/B300) - Datacenter Blackwell with tcgen05/TMEM
+        ext_modules.append(
+            CUDAExtension(
+                name="fp4attn_cuda_sm100",
+                sources=["sageattn3/sm100/api.cu"],
+                extra_compile_args={
+                    "cxx": ["-O3", "-std=c++17"],
+                    "nvcc": append_nvcc_threads(
+                        nvcc_flags + ["-DEXECMODE=0", "-DSM100"] + cc_flag
+                    ),
+                },
+                include_dirs=include_dirs,
+                libraries=["cuda"]
+            )
         )
-    )
+        # Also build the SM120 kernel for potential fallback/testing
+        # (commented out by default - SM100 and SM120 are incompatible)
+        # ext_modules.append(
+        #     CUDAExtension(
+        #         name="fp4attn_cuda_sm120",
+        #         sources=["sageattn3/blackwell/api.cu"],
+        #         extra_compile_args={
+        #             "cxx": ["-O3", "-std=c++17"],
+        #             "nvcc": append_nvcc_threads(
+        #                 nvcc_flags + ["-DEXECMODE=0"] +
+        #                 ["-gencode", "arch=compute_120a,code=sm_120a"]
+        #             ),
+        #         },
+        #         include_dirs=include_dirs,
+        #         libraries=["cuda"]
+        #     )
+        # )
+    else:
+        # SM120/SM121 (RTX 5090/GB10) - Consumer Blackwell with mma.sync.aligned
+        ext_modules.append(
+            CUDAExtension(
+                name="fp4attn_cuda",
+                sources=["sageattn3/blackwell/api.cu"],
+                extra_compile_args={
+                    "cxx": ["-O3", "-std=c++17"],
+                    "nvcc": append_nvcc_threads(
+                        nvcc_flags + ["-DEXECMODE=0"] + cc_flag
+                    ),
+                },
+                include_dirs=include_dirs,
+                # Without this we get and error about cuTensorMapEncodeTiled not defined
+                libraries=["cuda"]
+            )
+        )
+
+    # Quantization kernel is architecture-agnostic (works on all Blackwell)
     ext_modules.append(
         CUDAExtension(
             name="fp4quant_cuda",

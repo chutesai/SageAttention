@@ -19,8 +19,71 @@ import triton.language as tl
 import torch.nn.functional as F
 from typing import Tuple
 from torch.nn.functional import scaled_dot_product_attention as sdpa
-import fp4attn_cuda
 import fp4quant_cuda
+
+# Runtime detection of GPU architecture and appropriate kernel selection
+_fp4attn_cuda = None
+_gpu_arch = None
+
+def _get_fp4attn_cuda():
+    """Lazy load the appropriate attention CUDA module based on GPU architecture."""
+    global _fp4attn_cuda, _gpu_arch
+
+    if _fp4attn_cuda is not None:
+        return _fp4attn_cuda
+
+    # Detect GPU architecture
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available")
+
+    device_props = torch.cuda.get_device_properties(0)
+    cc_major, cc_minor = device_props.major, device_props.minor
+    _gpu_arch = (cc_major, cc_minor)
+
+    if cc_major == 10 and cc_minor == 0:
+        # SM100 (B200/B300) - Datacenter Blackwell with tcgen05/TMEM
+        try:
+            import fp4attn_cuda_sm100 as _fp4attn_cuda
+        except ImportError:
+            raise RuntimeError(
+                f"SM100 kernel (fp4attn_cuda_sm100) not found. "
+                f"Detected GPU: {device_props.name} (compute capability {cc_major}.{cc_minor}). "
+                f"Please rebuild with a B200/B300 GPU or use a pre-built wheel for SM100."
+            )
+    elif cc_major == 12 and cc_minor in (0, 1):
+        # SM120/SM121 (RTX 5090/GB10) - Consumer Blackwell with mma.sync.aligned
+        try:
+            import fp4attn_cuda as _fp4attn_cuda
+        except ImportError:
+            raise RuntimeError(
+                f"SM120 kernel (fp4attn_cuda) not found. "
+                f"Detected GPU: {device_props.name} (compute capability {cc_major}.{cc_minor}). "
+                f"Please rebuild with an RTX 5090/GB10 GPU or use a pre-built wheel for SM120."
+            )
+    else:
+        raise RuntimeError(
+            f"Unsupported GPU architecture: compute capability {cc_major}.{cc_minor}. "
+            f"SageAttention3 requires Blackwell GPUs: "
+            f"SM100 (B200/B300, compute 10.0) or SM120/SM121 (RTX 5090/GB10, compute 12.0/12.1)."
+        )
+
+    return _fp4attn_cuda
+
+def get_gpu_arch():
+    """Return the detected GPU architecture as (major, minor) tuple."""
+    if _gpu_arch is None:
+        _get_fp4attn_cuda()  # Force detection
+    return _gpu_arch
+
+def is_sm100():
+    """Check if running on SM100 (B200/B300) datacenter Blackwell."""
+    arch = get_gpu_arch()
+    return arch == (10, 0)
+
+def is_sm120():
+    """Check if running on SM120/SM121 (RTX 5090/GB10) consumer Blackwell."""
+    arch = get_gpu_arch()
+    return arch[0] == 12 and arch[1] in (0, 1)
 
 
 @triton.jit
@@ -115,17 +178,41 @@ def scale_and_quant_fp4_transpose(x: torch.Tensor) -> Tuple[torch.Tensor, torch.
     fp4quant_cuda.scaled_fp4_quant_trans(x, packed_fp4, fp8_scale, 1)
     return packed_fp4, fp8_scale
 
-def blockscaled_fp4_attn(qlist: Tuple, 
+def blockscaled_fp4_attn(qlist: Tuple,
                          klist: Tuple,
                          vlist: Tuple,
                          delta_s: torch.Tensor,
                          KL: int,
-                         is_causal: bool = False, 
+                         is_causal: bool = False,
                          per_block_mean: bool = True,
                          is_bf16: bool = True
                         ):
     softmax_scale = (qlist[0].shape[-1] * 2) ** (-0.5)
-    return fp4attn_cuda.fwd(qlist[0], klist[0], vlist[0], qlist[1], klist[1], vlist[1], delta_s, KL, None, softmax_scale, is_causal, per_block_mean, is_bf16)
+    fp4attn = _get_fp4attn_cuda()
+
+    # SM100 has a different API (no KL, out, is_bf16 parameters)
+    if is_sm100():
+        # SM100 kernel: fwd(q, k, v, out, sfq, sfk, sfv, delta_s, softmax_scale, is_causal, per_block_mean)
+        out = torch.empty(
+            qlist[0].shape[0],  # batch
+            qlist[0].shape[1],  # heads
+            qlist[0].shape[2],  # seqlen_q
+            qlist[0].shape[3] * 2,  # head_dim (unpacked from FP4)
+            device=qlist[0].device,
+            dtype=torch.bfloat16 if is_bf16 else torch.float16
+        )
+        return (fp4attn.fwd(
+            qlist[0], klist[0], vlist[0], out,
+            qlist[1], klist[1], vlist[1],
+            delta_s, softmax_scale, is_causal, per_block_mean
+        ),)
+    else:
+        # SM120 kernel: fwd(q, k, v, sfq, sfk, sfv, delta_s, KL, out, softmax_scale, is_causal, per_block_mean, is_bf16)
+        return fp4attn.fwd(
+            qlist[0], klist[0], vlist[0],
+            qlist[1], klist[1], vlist[1],
+            delta_s, KL, None, softmax_scale, is_causal, per_block_mean, is_bf16
+        )
 
 
 def sageattn3_blackwell(q, k, v, attn_mask = None, is_causal = False, per_block_mean = True, **kwargs):
