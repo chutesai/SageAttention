@@ -314,13 +314,17 @@ __global__ void scaled_fp4_quant_sm100_kernel(
   reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8) = __nv_fp8_e4m3(SFValue);
   SFValue = float(reinterpret_cast<__nv_fp8_e4m3&>(SFValueFP8));
 
-  float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 4];
+  float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 2];
+  float SFValueInv = (SFValue == 0.0f) ? 0.0f : 1.0f / SFValue;
   #pragma unroll
-  for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 4; i++) {
-    fp2Vals[i].x = SFValue != 0.0f ? float(in_vec.elts[i * 2].x) / SFValue : 0.0f;
-    fp2Vals[i].y = SFValue != 0.0f ? float(in_vec.elts[i * 2].y) / SFValue : 0.0f;
-    fp2Vals[i + 1].x = SFValue != 0.0f ? float(in_vec.elts[i * 2 + 1].x) / SFValue : 0.0f;
-    fp2Vals[i + 1].y = SFValue != 0.0f ? float(in_vec.elts[i * 2 + 1].y) / SFValue : 0.0f;
+  for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    if constexpr (std::is_same<T, half>::value) {
+      fp2Vals[i] = __half22float2(in_vec.elts[i]);
+    } else {
+      fp2Vals[i] = __bfloat1622float2(in_vec.elts[i]);
+    }
+    fp2Vals[i].x *= SFValueInv;
+    fp2Vals[i].y *= SFValueInv;
   }
 
   uint32_t e2m1Vals[CVT_FP4_ELTS_PER_THREAD / 8];

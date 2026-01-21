@@ -15,7 +15,7 @@ from sageattn3.api import (
     sageattn3_blackwell,
     scale_and_quant_fp4_sm100,
 )
-from sageattn3.quantization import fp4quant_cuda
+import fp4quant_cuda
 
 
 def _is_sm100():
