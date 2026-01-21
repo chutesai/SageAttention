@@ -20,6 +20,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime_api.h>
 #include <cuda_runtime.h>
+#include <math.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -27,6 +28,8 @@
 #include <cuda_fp8.h>
 
 #include "cuda_utils.h"
+#include "cutlass/detail/sm100_blockscaled_layout.hpp"
+#include "cute/tensor.hpp"
 
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                \
   if (pytorch_dtype == at::ScalarType::Half) {                                          \
@@ -343,9 +346,12 @@ __global__ void scaled_fp4_quant_sm100_kernel(
   }
 
   if (token_id < num_tokens) {
-    uint32_t col_id_local = threadIdx.x % NUM_THREADS_PER_TOKEN;
-    uint32_t offset_local = token_id * stride_seq_output_sf + col_id_local;
-    reinterpret_cast<uint8_t*>(output_sf + batch_id * stride_bz_output_sf + head_id * stride_h_output_sf + offset_local)[0] = SFValueFP8;
+    using Sm100Config = cutlass::detail::Sm1xxBlockScaledConfig<16>;
+    auto layout_sfa = Sm100Config::tile_atom_to_shape_SFA(cute::make_shape(num_tokens, head_dim, batch_size * num_heads));
+    int l = batch_id * num_heads + head_id;
+    int k_coord = int(threadIdx.x % NUM_THREADS_PER_TOKEN) * 16;
+    int64_t offset = layout_sfa(cute::make_coord(token_id, k_coord, l));
+    output_sf[offset] = SFValueFP8;
   }
 }
 
@@ -613,6 +619,106 @@ void scaled_fp4_quant_sm100(torch::Tensor const& input,
   });
 }
 
+__device__ __forceinline__ float fp4_e2m1_to_float(uint8_t v) {
+  int sign = (v >> 3) & 0x1;
+  int exp = (v >> 1) & 0x3;
+  int mant = v & 0x1;
+  float mant_f = 0.5f * static_cast<float>(mant);
+  float val = 0.0f;
+  if (exp == 0) {
+    val = mant_f;
+  } else {
+    val = ldexpf(1.0f + mant_f, exp - 1);
+  }
+  return sign ? -val : val;
+}
+
+template <uint32_t head_dim, typename OutType>
+__global__ void scaled_fp4_dequant_sm100_kernel(
+    const uint8_t* input, const uint8_t* input_sf, OutType* output,
+    int batch_size, int num_heads, int num_tokens,
+    int stride_bz_input, int stride_h_input, int stride_seq_input,
+    int stride_bz_output, int stride_h_output, int stride_seq_output) {
+  const int batch_id = blockIdx.y;
+  const int head_id = blockIdx.z;
+  const int token_id = blockIdx.x;
+  const int d_pair = threadIdx.x;
+  if (d_pair >= (head_dim / 2)) {
+    return;
+  }
+
+  const int d0 = d_pair * 2;
+  const int d1 = d0 + 1;
+
+  using Sm100Config = cutlass::detail::Sm1xxBlockScaledConfig<16>;
+  auto layout_sfa = Sm100Config::tile_atom_to_shape_SFA(cute::make_shape(num_tokens, head_dim, batch_size * num_heads));
+  int l = batch_id * num_heads + head_id;
+  int k_coord = (d0 / 16) * 16;
+  int64_t sf_offset = layout_sfa(cute::make_coord(token_id, k_coord, l));
+  uint8_t scale_byte = input_sf[sf_offset];
+  float scale = float(reinterpret_cast<__nv_fp8_e4m3&>(scale_byte));
+
+  int64_t packed_offset = batch_id * stride_bz_input +
+                          head_id * stride_h_input +
+                          token_id * stride_seq_input +
+                          d_pair;
+  uint8_t packed = input[packed_offset];
+  uint8_t lo = packed & 0x0F;
+  uint8_t hi = (packed >> 4) & 0x0F;
+
+  int64_t out_base = batch_id * stride_bz_output +
+                     head_id * stride_h_output +
+                     token_id * stride_seq_output;
+  if (d0 < head_dim) {
+    output[out_base + d0] = static_cast<OutType>(fp4_e2m1_to_float(lo) * scale);
+  }
+  if (d1 < head_dim) {
+    output[out_base + d1] = static_cast<OutType>(fp4_e2m1_to_float(hi) * scale);
+  }
+}
+
+torch::Tensor scaled_fp4_dequant_sm100(torch::Tensor const& input,
+                                       torch::Tensor const& input_sf) {
+  CHECK_CUDA(input);
+  CHECK_CUDA(input_sf);
+  CHECK_DTYPE(input, at::ScalarType::Byte);
+  CHECK_DTYPE(input_sf, at::ScalarType::Float8_e4m3fn);
+  CHECK_DIMS(input, 4);
+  CHECK_DIMS(input_sf, 4);
+
+  const int batch_size = input.size(0);
+  const int num_heads = input.size(1);
+  const int num_tokens = input.size(2);
+  const int head_dim = input.size(3) * 2;
+
+  auto output = torch::empty({batch_size, num_heads, num_tokens, head_dim},
+                             input.options().dtype(torch::kFloat32));
+
+  const int stride_bz_input = input.stride(0);
+  const int stride_h_input = input.stride(1);
+  const int stride_seq_input = input.stride(2);
+  const int stride_bz_output = output.stride(0);
+  const int stride_h_output = output.stride(1);
+  const int stride_seq_output = output.stride(2);
+
+  auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+    dim3 block(HEAD_DIM / 2, 1, 1);
+    dim3 grid(num_tokens, batch_size, num_heads);
+    scaled_fp4_dequant_sm100_kernel<HEAD_DIM, float>
+        <<<grid, block, 0, stream>>>(
+            reinterpret_cast<uint8_t const*>(input.data_ptr()),
+            reinterpret_cast<uint8_t const*>(input_sf.data_ptr()),
+            reinterpret_cast<float*>(output.data_ptr()),
+            batch_size, num_heads, num_tokens,
+            stride_bz_input, stride_h_input, stride_seq_input,
+            stride_bz_output, stride_h_output, stride_seq_output);
+  });
+
+  return output;
+}
+
 void scaled_fp4_quant_permute(torch::Tensor const& input,
                             torch::Tensor const& output,
                             torch::Tensor const& output_sf,
@@ -776,4 +882,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("scaled_fp4_quant_permute", &scaled_fp4_quant_permute);
   m.def("scaled_fp4_quant_trans", &scaled_fp4_quant_trans);
   m.def("scaled_fp4_quant_sm100", &scaled_fp4_quant_sm100);
+  m.def("scaled_fp4_dequant_sm100", &scaled_fp4_dequant_sm100);
 }

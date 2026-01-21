@@ -21,6 +21,8 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cutlass/detail/sm100_blockscaled_layout.hpp>
+#include <cute/tensor.hpp>
 
 #include <cutlass/float_subbyte.h>
 
@@ -41,11 +43,17 @@ __device__ __forceinline__ float fp8_to_float(uint8_t byte) {
     return float(fp8);
 }
 
-__device__ __forceinline__ float load_fp4_scaled(const uint8_t* packed, const uint8_t* sf, int d) {
+__device__ __forceinline__ float load_fp4_scaled(const uint8_t* packed, const uint8_t* sf, int d,
+                                                 int token, int head_dim, int l,
+                                                 int seqlen, int total_l) {
     uint8_t byte = packed[d >> 1];
     uint8_t nibble = (d & 1) ? (byte >> 4) : (byte & 0xF);
     float val = fp4_to_float(nibble);
-    float scale = fp8_to_float(sf[d >> 4]);
+    using Sm100Config = cutlass::detail::Sm1xxBlockScaledConfig<16>;
+    auto layout_sfa = Sm100Config::tile_atom_to_shape_SFA(cute::make_shape(seqlen, head_dim, total_l));
+    int k_coord = (d >> 4) * 16;
+    int64_t offset = layout_sfa(cute::make_coord(token, k_coord, l));
+    float scale = fp8_to_float(sf[offset]);
     return val * scale;
 }
 
@@ -66,6 +74,8 @@ __global__ void fp4_attn_sm100_kernel(
     float softmax_scale,
     bool is_causal,
     bool per_block_mean,
+    int num_heads,
+    int total_l,
     int64_t stride_qb,
     int64_t stride_qh,
     int64_t stride_qq,
@@ -105,8 +115,9 @@ __global__ void fp4_attn_sm100_kernel(
     int group_id = per_block_mean ? (q_idx / kBlockM) : 0;
 
     const uint8_t* q_ptr = q + b * stride_qb + h * stride_qh + q_idx * stride_qq;
-    const uint8_t* sfq_ptr = sfq + b * stride_sfq_b + h * stride_sfq_h + q_idx * stride_sfq_q;
+    const uint8_t* sfq_ptr = sfq;
     const float* ds_ptr = delta_s + b * stride_ds_b + h * stride_ds_h + group_id * stride_ds_m;
+    int l = b * num_heads + h;
 
     int max_k = is_causal ? (q_idx + 1 + seqlen_k - seqlen_q) : seqlen_k;
     int k_limit = unpadded_k < max_k ? unpadded_k : max_k;
@@ -127,12 +138,12 @@ __global__ void fp4_attn_sm100_kernel(
     float max_logit = -INFINITY;
     for (int k_idx = 0; k_idx < k_limit; ++k_idx) {
         const uint8_t* k_ptr = k + b * stride_kb + h * stride_kh + k_idx * stride_kk;
-        const uint8_t* sfk_ptr = sfk + b * stride_sfk_b + h * stride_sfk_h + k_idx * stride_sfk_k;
+        const uint8_t* sfk_ptr = sfk;
         float acc = 0.0f;
         #pragma unroll
         for (int d = 0; d < HEAD_DIM; ++d) {
-            float q_val = load_fp4_scaled(q_ptr, sfq_ptr, d);
-            float k_val = load_fp4_scaled(k_ptr, sfk_ptr, d);
+            float q_val = load_fp4_scaled(q_ptr, sfq_ptr, d, q_idx, HEAD_DIM, l, seqlen_q, total_l);
+            float k_val = load_fp4_scaled(k_ptr, sfk_ptr, d, k_idx, HEAD_DIM, l, seqlen_k, total_l);
             acc += q_val * k_val;
         }
         acc = (acc + ds_ptr[k_idx * stride_ds_k]) * softmax_scale;
@@ -148,14 +159,14 @@ __global__ void fp4_attn_sm100_kernel(
 
     for (int k_idx = 0; k_idx < k_limit; ++k_idx) {
         const uint8_t* k_ptr = k + b * stride_kb + h * stride_kh + k_idx * stride_kk;
-        const uint8_t* sfk_ptr = sfk + b * stride_sfk_b + h * stride_sfk_h + k_idx * stride_sfk_k;
+        const uint8_t* sfk_ptr = sfk;
         const uint8_t* v_ptr = v + b * stride_vb + h * stride_vh + k_idx * stride_vk;
-        const uint8_t* sfv_ptr = sfv + b * stride_sfv_b + h * stride_sfv_h + k_idx * stride_sfv_k;
+        const uint8_t* sfv_ptr = sfv;
         float acc = 0.0f;
         #pragma unroll
         for (int d = 0; d < HEAD_DIM; ++d) {
-            float q_val = load_fp4_scaled(q_ptr, sfq_ptr, d);
-            float k_val = load_fp4_scaled(k_ptr, sfk_ptr, d);
+            float q_val = load_fp4_scaled(q_ptr, sfq_ptr, d, q_idx, HEAD_DIM, l, seqlen_q, total_l);
+            float k_val = load_fp4_scaled(k_ptr, sfk_ptr, d, k_idx, HEAD_DIM, l, seqlen_k, total_l);
             acc += q_val * k_val;
         }
         acc = (acc + ds_ptr[k_idx * stride_ds_k]) * softmax_scale;
@@ -163,7 +174,7 @@ __global__ void fp4_attn_sm100_kernel(
         sum += w;
         #pragma unroll
         for (int d = 0; d < HEAD_DIM; ++d) {
-            float v_val = load_fp4_scaled(v_ptr, sfv_ptr, d);
+            float v_val = load_fp4_scaled(v_ptr, sfv_ptr, d, k_idx, HEAD_DIM, l, seqlen_k, total_l);
             out_acc[d] += w * v_val;
         }
     }
@@ -254,6 +265,8 @@ void run_fp4_attn_sm100(
             softmax_scale,
             is_causal,
             per_block_mean,
+            q.size(1),
+            q.size(0) * q.size(1),
             stride_qb,
             stride_qh,
             stride_qq,
@@ -299,6 +312,8 @@ void run_fp4_attn_sm100(
             softmax_scale,
             is_causal,
             per_block_mean,
+            q.size(1),
+            q.size(0) * q.size(1),
             stride_qb,
             stride_qh,
             stride_qq,
