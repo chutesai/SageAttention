@@ -84,7 +84,7 @@ if not SKIP_CUDA_BUILD:
         # Clone CUTLASS v3.8.0 which has proper SM100 support
         # Note: Newer versions may have broken namespace declarations in SM100 code
         subprocess.run(
-            ["git", "clone", "--depth", "1", "--branch", "v3.8.0",
+            ["git", "clone", "--depth", "1", "--branch", "v4.3.5",
              "https://github.com/NVIDIA/cutlass.git", str(cutlass_dir)],
             check=True
         )
