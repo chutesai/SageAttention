@@ -48,7 +48,7 @@ struct CollectiveMainloopFwdSm100 {
     using GmemTiledCopy = typename Ktraits::GmemTiledCopy;
     using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
     using SmemLayoutK = typename Ktraits::SmemLayoutK;
-    using SmemLayoutV = typename Ktraits::SmemLayoutV;
+    using SmemLayoutVt = typename Ktraits::SmemLayoutVt;
     using SmemLayoutDS = typename Ktraits::SmemLayoutDS;
     using SmemLayoutAtomDS = typename Ktraits::SmemLayoutAtomDS;
     using LayoutDS = decltype(
@@ -61,7 +61,7 @@ struct CollectiveMainloopFwdSm100 {
         );
     using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
     using StrideQKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
-    using ShapeSF = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen, d // 16, head*batch)
+    using ShapeSF = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
     using LayoutSF = typename Ktraits::LayoutSF;
     using LayoutP = typename Ktraits::LayoutP;
     using LayoutSFP = typename Ktraits::LayoutSFP;
@@ -80,11 +80,11 @@ struct CollectiveMainloopFwdSm100 {
         select<1, 2>(TileShape_MNK{}),
         _1{})); 
     
-    using TMA_V = decltype(make_tma_copy(
+    using TMA_Vt = decltype(make_tma_copy(
         GmemTiledCopy{},
         make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), repeat_like(StrideQKV{}, int32_t(0)), StrideQKV{}),
-        take<0, 2>(SmemLayoutV{}),
-        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
+        take<0, 2>(SmemLayoutVt{}),
+        make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
         _1{})); 
     
     using TMA_DS = decltype(make_tma_copy(
@@ -98,7 +98,7 @@ struct CollectiveMainloopFwdSm100 {
     using GmemTiledCopySF = typename Ktraits::GmemTiledCopySF;
     using SmemLayoutSFQ = typename Ktraits::SmemLayoutSFQ;
     using SmemLayoutSFK = typename Ktraits::SmemLayoutSFK;
-    using SmemLayoutSFV = typename Ktraits::SmemLayoutSFV;
+    using SmemLayoutSFVt = typename Ktraits::SmemLayoutSFVt;
 
     using TMA_SFQ = decltype(make_tma_copy<uint16_t>(
         GmemTiledCopySF{},
@@ -115,11 +115,11 @@ struct CollectiveMainloopFwdSm100 {
         make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
         _1{}));
 
-    using TMA_SFV = decltype(make_tma_copy<uint16_t>(
+    using TMA_SFVt = decltype(make_tma_copy<uint16_t>(
         GmemTiledCopySF{},
         make_tensor(static_cast<ElementSF const*>(nullptr), LayoutSF{}),
-        SmemLayoutSFV{}(_,_,_,cute::Int<0>{}),
-        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
+        SmemLayoutSFVt{}(_,_,cute::Int<0>{}),
+        make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
         _1{}));
 
     using SmemCopyAtomQ = typename Ktraits::SmemCopyAtomQ;
@@ -147,8 +147,8 @@ struct CollectiveMainloopFwdSm100 {
         cutlass::bits_to_bytes(size(take<0,2>(SmemLayoutK{})) * sizeof_bits<Element>::value));
     
     static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(
-        cutlass::bits_to_bytes(cosize(take<0,2>(SmemLayoutSFV{})) * cute::sizeof_bits_v<ElementSF>) +
-        cutlass::bits_to_bytes(size(take<0,2>(SmemLayoutV{})) * sizeof_bits<Element>::value));
+        cutlass::bits_to_bytes(cosize(take<0,2>(SmemLayoutSFVt{})) * cute::sizeof_bits_v<ElementSF>) +
+        cutlass::bits_to_bytes(size(take<0,2>(SmemLayoutVt{})) * sizeof_bits<Element>::value));
 
     // Host side kernel arguments
     struct Arguments {
@@ -159,15 +159,15 @@ struct CollectiveMainloopFwdSm100 {
         ShapeQKV const shape_K;
         StrideQKV const stride_K;
         ShapeQKV const unpadded_shape_K;
-        Element const* ptr_V;
-        ShapeQKV const shape_V;
-        StrideQKV const stride_V;
+        Element const* ptr_Vt;
+        ShapeQKV const shape_Vt;
+        StrideQKV const stride_Vt;
         ElementSF const* ptr_SFQ{nullptr};
         ShapeSF const shape_SFQ{};
         ElementSF const* ptr_SFK{nullptr};
         ShapeSF const shape_SFK{};
-        ElementSF const* ptr_SFV{nullptr};
-        ShapeSF const shape_SFV{};
+        ElementSF const* ptr_SFVt{nullptr};
+        ShapeSF const shape_SFVt{};
         float const* ptr_ds;
         ShapeQKV const shape_ds;
         StrideQKV const stride_ds;
@@ -181,15 +181,15 @@ struct CollectiveMainloopFwdSm100 {
         ShapeQKV const shape_K;
         ShapeQKV const unpadded_shape_K;
         LayoutSF const layout_SFK;
-        ShapeQKV const shape_V;
-        LayoutSF const layout_SFV;
+        ShapeQKV const shape_Vt;
+        LayoutSF const layout_SFVt;
         LayoutDS const layout_DS;
         TMA_Q tma_load_Q;
         TMA_SFQ tma_load_SFQ;
         TMA_KV tma_load_K;
         TMA_SFKV tma_load_SFK;
-        TMA_V tma_load_V;
-        TMA_SFV tma_load_SFV;
+        TMA_Vt tma_load_Vt;
+        TMA_SFVt tma_load_SFVt;
         TMA_DS tma_load_DS;
         float const softmax_scale_log2;
     };
@@ -211,12 +211,12 @@ struct CollectiveMainloopFwdSm100 {
             SmemLayoutK{}(_, _, _0{}),
             select<1, 2>(TileShape_MNK{}),
             _1{}); // mcast along M mode for this N load, if any
-        Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V), args.shape_V, args.stride_V);
-        TMA_V tma_load_V = make_tma_copy(
+        Tensor mVt = make_tensor(make_gmem_ptr(args.ptr_Vt), args.shape_Vt, args.stride_Vt);
+        TMA_Vt tma_load_Vt = make_tma_copy(
             GmemTiledCopy{},
-            mV,
-            SmemLayoutV{}(_, _, _0{}),
-            make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
+            mVt,
+            SmemLayoutVt{}(_, _, _0{}),
+            make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
             _1{}); // mcast along M mode for this N load, if any
         auto [Seqlen_Q, Seqlen_K, HeadNum, Batch] = args.shape_ds;
         LayoutDS layout_ds = tile_to_shape(SmemLayoutAtomDS{}, make_shape(Seqlen_Q, Seqlen_K, HeadNum, Batch), Step<_2,_1,_3,_4>{});
@@ -227,7 +227,7 @@ struct CollectiveMainloopFwdSm100 {
             SmemLayoutDS{}(_, _, _0{}),
             make_shape(shape<0>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
             _1{});
-        LayoutSF layout_sfq = BlkScaledConfig::tile_atom_to_shape_SFA(args.shape_SFQ);
+        LayoutSF layout_sfq = BlkScaledConfig::tile_atom_to_shape_SFQKV(args.shape_SFQ);
         Tensor mSFQ = make_tensor(make_gmem_ptr(args.ptr_SFQ), layout_sfq);
         TMA_SFQ tma_load_sfq = make_tma_copy<uint16_t>(
             GmemTiledCopySF{},
@@ -235,7 +235,7 @@ struct CollectiveMainloopFwdSm100 {
             SmemLayoutSFQ{},
             make_shape(shape<0>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
             _1{});
-        LayoutSF layout_sfk = BlkScaledConfig::tile_atom_to_shape_SFB(args.shape_SFK);
+        LayoutSF layout_sfk = BlkScaledConfig::tile_atom_to_shape_SFQKV(args.shape_SFK);
         Tensor mSFK = make_tensor(make_gmem_ptr(args.ptr_SFK), layout_sfk);
         TMA_SFKV tma_load_sfk = make_tma_copy<uint16_t>(
             GmemTiledCopySF{},
@@ -243,21 +243,21 @@ struct CollectiveMainloopFwdSm100 {
             SmemLayoutSFK{}(_, _, _, _0{}),
             make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
             _1{});
-        LayoutSF layout_sfv = BlkScaledConfig::tile_atom_to_shape_SFB(args.shape_SFV);
-        Tensor mSFV = make_tensor(make_gmem_ptr(args.ptr_SFV), layout_sfv);
-        TMA_SFV tma_load_sfv = make_tma_copy<uint16_t>(
+        LayoutSF layout_sfvt = BlkScaledConfig::tile_atom_to_shape_SFVt(args.shape_SFVt);
+        Tensor mSFVt = make_tensor(make_gmem_ptr(args.ptr_SFVt), layout_sfvt);
+        TMA_SFVt tma_load_sfv = make_tma_copy<uint16_t>(
             GmemTiledCopySF{},
-            mSFV,
-            SmemLayoutSFV{}(_, _, _, _0{}),
-            make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
+            mSFVt,
+            SmemLayoutSFVt{}(_, _, _0{}),
+            make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
             _1{});
         return {args.shape_Q, layout_sfq,
                 args.shape_K, args.unpadded_shape_K, layout_sfk,
-                args.shape_V, layout_sfv,
+                args.shape_Vt, layout_sfvt,
                 layout_ds,
                 tma_load_Q, tma_load_sfq,
                 tma_load_K, tma_load_sfk,
-                tma_load_V, tma_load_sfv,
+                tma_load_Vt, tma_load_sfv,
                 tma_load_ds,
                 args.softmax_scale_log2};
     }
@@ -267,10 +267,10 @@ struct CollectiveMainloopFwdSm100 {
     static void prefetch_tma_descriptors(Params const& mainloop_params) {
         cute::prefetch_tma_descriptor(mainloop_params.tma_load_Q.get_tma_descriptor());
         cute::prefetch_tma_descriptor(mainloop_params.tma_load_K.get_tma_descriptor());
-        cute::prefetch_tma_descriptor(mainloop_params.tma_load_V.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(mainloop_params.tma_load_Vt.get_tma_descriptor());
         cute::prefetch_tma_descriptor(mainloop_params.tma_load_SFQ.get_tma_descriptor());
         cute::prefetch_tma_descriptor(mainloop_params.tma_load_SFK.get_tma_descriptor());
-        cute::prefetch_tma_descriptor(mainloop_params.tma_load_SFV.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(mainloop_params.tma_load_SFVt.get_tma_descriptor());
         cute::prefetch_tma_descriptor(mainloop_params.tma_load_DS.get_tma_descriptor());
     }
 
@@ -452,27 +452,27 @@ struct CollectiveMainloopFwdSm100 {
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.begin()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.begin()), SmemLayoutK{});
-        Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.begin()), SmemLayoutV{});
+        Tensor sVt = make_tensor(make_smem_ptr(shared_storage.smem_v.begin()), SmemLayoutVt{});
         Tensor sSFQ = make_tensor(make_smem_ptr(shared_storage.smem_SFQ.begin()), SmemLayoutSFQ{});
         Tensor sSFK = make_tensor(make_smem_ptr(shared_storage.smem_SFK.begin()), SmemLayoutSFK{});
-        Tensor sSFV = make_tensor(make_smem_ptr(shared_storage.smem_SFV.begin()), SmemLayoutSFV{});
+        Tensor sSFVt = make_tensor(make_smem_ptr(shared_storage.smem_SFV.begin()), SmemLayoutSFVt{});
         Tensor sSFK_tma = make_tensor(make_smem_ptr(shared_storage.smem_SFK.begin()), filter_zeros(SmemLayoutSFK{}));
-        Tensor sSFV_tma = make_tensor(make_smem_ptr(shared_storage.smem_SFV.begin()), filter_zeros(SmemLayoutSFV{}));
+        Tensor sSFV_tma = make_tensor(make_smem_ptr(shared_storage.smem_SFV.begin()), filter_zeros(SmemLayoutSFVt{}));
         Tensor sDS = make_tensor(make_smem_ptr(shared_storage.smem_ds.begin()), SmemLayoutDS{});
 
         Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.shape_Q);
         Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.shape_K);
-        Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.shape_V);
+        Tensor mVt = mainloop_params.tma_load_Vt.get_tma_tensor(mainloop_params.shape_Vt);
         Tensor mDS = mainloop_params.tma_load_DS.get_tma_tensor(shape(mainloop_params.layout_DS));
         Tensor mSFQ = mainloop_params.tma_load_SFQ.get_tma_tensor(shape(mainloop_params.layout_SFQ));
         Tensor mSFK = mainloop_params.tma_load_SFK.get_tma_tensor(shape(mainloop_params.layout_SFK));
-        Tensor mSFV = mainloop_params.tma_load_SFV.get_tma_tensor(shape(mainloop_params.layout_SFV));
+        Tensor mSFVt = mainloop_params.tma_load_SFVt.get_tma_tensor(shape(mainloop_params.layout_SFVt));
         uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
         Tensor gQ = local_tile(mQ(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         Tensor gK = local_tile(mK(_, _, bidh, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
-        Tensor gV = local_tile(mV(_, _, bidh, bidb), make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})), make_coord(_0{}, _));  // (N, K, _)
+        Tensor gVt = local_tile(mVt(_, _, bidh, bidb), make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})), make_coord(_0{}, _));  // (K, N, _)
         Tensor gDS = [&] {
                         if constexpr (BlockMean) {
                             return local_tile(mDS(_, _, bidh, bidb), select<0, 1>(TileShape_MNK{}), make_coord(m_block, _));
@@ -483,7 +483,7 @@ struct CollectiveMainloopFwdSm100 {
         int l = bidh + bidb * get<2>(mainloop_params.shape_Q);
         Tensor gSFQ = local_tile(mSFQ(_, _, l), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
         Tensor gSFK = local_tile(mSFK, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, l));
-        Tensor gSFV = local_tile(mSFV, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})), make_coord(_0{}, _, l));
+        Tensor gSFVt = local_tile(mSFVt, make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})), make_coord(_0{}, _, l));
         auto block_tma_q = mainloop_params.tma_load_Q.get_slice(_0{});
         Tensor tQgQ = block_tma_q.partition_S(gQ);
         Tensor tQsQ = block_tma_q.partition_D(sQ);
@@ -496,12 +496,12 @@ struct CollectiveMainloopFwdSm100 {
         auto block_tma_sfk = mainloop_params.tma_load_SFK.get_slice(cluster_local_block_id.x);
         Tensor tKgSFK = block_tma_sfk.partition_S(gSFK);
         Tensor tKsSFK = block_tma_sfk.partition_D(sSFK_tma);
-        auto block_tma_v = mainloop_params.tma_load_V.get_slice(cluster_local_block_id.x);
-        Tensor tVgV = group_modes<0, 3>(block_tma_v.partition_S(gV));
-        Tensor tVsV = group_modes<0, 3>(block_tma_v.partition_D(sV));
-        auto block_tma_sfv = mainloop_params.tma_load_SFV.get_slice(cluster_local_block_id.x);
-        Tensor tVgSFV = block_tma_sfv.partition_S(gSFV);
-        Tensor tVsSFV = block_tma_sfv.partition_D(sSFV_tma);
+        auto block_tma_v = mainloop_params.tma_load_Vt.get_slice(cluster_local_block_id.x);
+        Tensor tVgVt = group_modes<0, 3>(block_tma_v.partition_S(gVt));
+        Tensor tVsVt = group_modes<0, 3>(block_tma_v.partition_D(sVt));
+        auto block_tma_sfv = mainloop_params.tma_load_SFVt.get_slice(cluster_local_block_id.x);
+        Tensor tVgSFVt = block_tma_sfv.partition_S(gSFVt);
+        Tensor tVsSFVt = block_tma_sfv.partition_D(sSFV_tma);
         auto block_tma_ds = mainloop_params.tma_load_DS.get_slice(cluster_local_block_id.x);
         Tensor tDSgDS = group_modes<0, 3>(block_tma_ds.partition_S(gDS));
         Tensor tDSsDS = group_modes<0, 3>(block_tma_ds.partition_D(sDS));
@@ -523,10 +523,10 @@ struct CollectiveMainloopFwdSm100 {
             tDSgDS(_, n_block), tDSsDS(_, smem_pipe_write_k.index()));
         ++smem_pipe_write_k;
         pipeline_v.producer_acquire(smem_pipe_write_v);
-        copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
-            tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));
-        copy(mainloop_params.tma_load_SFV.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
-            tVgSFV(_, n_block), tVsSFV(_, smem_pipe_write_v.index()));
+        copy(mainloop_params.tma_load_Vt.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
+            tVgVt(_, n_block), tVsVt(_, smem_pipe_write_v.index()));
+        copy(mainloop_params.tma_load_SFVt.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
+            tVgSFVt(_, n_block), tVsSFVt(_, smem_pipe_write_v.index()));
         ++smem_pipe_write_v;
         }
 
@@ -544,10 +544,10 @@ struct CollectiveMainloopFwdSm100 {
                     tDSgDS(_, n_block), tDSsDS(_, smem_pipe_write_k.index()));
                 ++smem_pipe_write_k;
                 pipeline_v.producer_acquire(smem_pipe_write_v);
-                copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
-                    tVgV(_, n_block), tVsV(_, smem_pipe_write_v.index()));
-                copy(mainloop_params.tma_load_SFV.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
-                    tVgSFV(_, n_block), tVsSFV(_, smem_pipe_write_v.index()));
+                copy(mainloop_params.tma_load_Vt.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
+                    tVgVt(_, n_block), tVsVt(_, smem_pipe_write_v.index()));
+                copy(mainloop_params.tma_load_SFVt.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v), mcast_mask_kv),
+                    tVgSFVt(_, n_block), tVsSFVt(_, smem_pipe_write_v.index()));
                 ++smem_pipe_write_v;
             }
         }
@@ -596,11 +596,11 @@ struct CollectiveMainloopFwdSm100 {
         static constexpr int kBlockK = get<2>(TileShape_MNK{});
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.begin()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.begin()), SmemLayoutK{});
-        Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.begin()), SmemLayoutV{});
+        Tensor sVt = make_tensor(make_smem_ptr(shared_storage.smem_v.begin()), SmemLayoutVt{});
         Tensor sDS = make_tensor(make_smem_ptr(shared_storage.smem_ds.begin()), SmemLayoutDS{});
         Tensor sSFQ = make_tensor(make_smem_ptr(shared_storage.smem_SFQ.begin()), SmemLayoutSFQ{});
         Tensor sSFK = make_tensor(make_smem_ptr(shared_storage.smem_SFK.begin()), SmemLayoutSFK{});
-        Tensor sSFV = make_tensor(make_smem_ptr(shared_storage.smem_SFV.begin()), SmemLayoutSFV{});
+        Tensor sSFVt = make_tensor(make_smem_ptr(shared_storage.smem_SFV.begin()), SmemLayoutSFVt{});
 
         Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));
         Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));
@@ -611,11 +611,11 @@ struct CollectiveMainloopFwdSm100 {
 
         Tensor tSrQ = thread_mma_qk.partition_fragment_A(sQ);
         Tensor tSrK = thread_mma_qk.partition_fragment_B(sK(_,_,Int<0>{}));
-        Tensor tOrV = thread_mma_pv.partition_fragment_B(sV(_,_,Int<0>{}));
+        Tensor tOrV = thread_mma_pv.partition_fragment_B(sVt(_,_,Int<0>{}));
         Tensor tOrP = make_tensor_like<Element>(LayoutP{});
         Tensor tSrSFQ = partition_fragment_SFA(sSFQ, thread_mma_qk);
         Tensor tSrSFK = partition_fragment_SFB(sSFK(_,_,_,Int<0>{}), thread_mma_qk);
-        Tensor tOrSFV = partition_fragment_SFB(sSFV(_,_,_,Int<0>{}), thread_mma_pv);
+        Tensor tOrSFV = partition_fragment_SFB(sSFVt(_,_,_,Int<0>{}), thread_mma_pv);
         Tensor tOrSFP = make_tensor<ElementSF>(LayoutSFP{});
         Tensor tOrSFP_flt = filter_zeros(tOrSFP);
         Tensor tSrDS = make_tensor<float>(make_shape(_8{}, _4{}), make_stride(_1{}, _8{}));
@@ -632,7 +632,7 @@ struct CollectiveMainloopFwdSm100 {
 
         auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomKV{}, tiled_mma_pv);
         auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(thread_idx);
-        Tensor tOsV = smem_thr_copy_V.partition_S(as_position_independent_swizzle_tensor(sV));
+        Tensor tOsV = smem_thr_copy_V.partition_S(as_position_independent_swizzle_tensor(sVt));
         Tensor tOrV_copy_view = smem_thr_copy_V.retile_D(tOrV); 
 
         auto tile_shape_mnk = tile_shape(tiled_mma_qk);
@@ -657,7 +657,7 @@ struct CollectiveMainloopFwdSm100 {
                                                         make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk))
                                                         );
         auto smem_thr_copy_SFV = smem_tiled_copy_SFV.get_thread_slice(thread_idx);
-        Tensor tOsSFV = smem_thr_copy_SFV.partition_S(as_position_independent_swizzle_tensor(sSFV));
+        Tensor tOsSFV = smem_thr_copy_SFV.partition_S(as_position_independent_swizzle_tensor(sSFVt));
         Tensor tOrSFV_copy_view = smem_thr_copy_SFV.retile_D(tOrSFV);
 
         auto consumer_wait = [](auto& pipeline, auto& smem_pipe_read) {

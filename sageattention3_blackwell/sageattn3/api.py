@@ -149,7 +149,8 @@ def sageattn3_blackwell(q, k, v, attn_mask = None, is_causal = False, per_block_
     if is_sm100:
         qlist_from_cuda = scale_and_quant_fp4_sm100(q)
         klist_from_cuda = scale_and_quant_fp4_sm100(k)
-        vlist_from_cuda = scale_and_quant_fp4_sm100(v)
+        v_t = v.transpose(-2, -1).contiguous()
+        vlist_from_cuda = scale_and_quant_fp4_sm100(v_t)
     else:
         qlist_from_cuda = scale_and_quant_fp4(q)
         klist_from_cuda = scale_and_quant_fp4_permute(k)

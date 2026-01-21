@@ -26,7 +26,6 @@
 
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/collective/builders/sm100_common.inl"
-#include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cute/arch/copy_sm90_tma.hpp"
 #include "cute/arch/mma_sm100_umma.hpp"
 
@@ -136,6 +135,8 @@ struct Flash_fwd_kernel_traits_sm100 {
         decltype(size<1>(TileShape_MNK{})), decltype(size<2>(TileShape_MNK{}))>());
     using SmemLayoutAtomV = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<UMMA::Major::K, Element,
         decltype(size<1>(TileShape_MNK{})), decltype(size<2>(TileShape_MNK{}))>());
+    using SmemLayoutAtomVt = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<UMMA::Major::K, Element,
+        decltype(size<2>(TileShape_MNK{})), decltype(size<1>(TileShape_MNK{}))>());
     using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQ{}, select<0, 2>(TileShape_MNK{})));
     using SmemLayoutK =
         decltype(tile_to_shape(SmemLayoutAtomK{},
@@ -143,6 +144,9 @@ struct Flash_fwd_kernel_traits_sm100 {
     using SmemLayoutV =
         decltype(tile_to_shape(SmemLayoutAtomV{},
                  make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
+    using SmemLayoutVt =
+        decltype(tile_to_shape(SmemLayoutAtomVt{},
+                 make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{})));
     using SmemLayoutAtomDS = Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<_0, _1>>;
     using SmemLayoutDS =
         decltype(tile_to_shape(SmemLayoutAtomDS{},
@@ -153,12 +157,14 @@ struct Flash_fwd_kernel_traits_sm100 {
     using SmemCopyAtomSF = Copy_Atom<UniversalCopy<ElementSF>, ElementSF>;
     using SmemCopyAtomDS = Copy_Atom<UniversalCopy<float>, float>;
 
-    using BlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<SFVectorSize>;
+    using BlkScaledConfig = flash::BlockScaledConfig<SFVectorSize>;
     using LayoutSF = typename BlkScaledConfig::LayoutSF;
     using SfAtom = typename BlkScaledConfig::SfAtom;
-    using SmemLayoutAtomSFQ = decltype(BlkScaledConfig::deduce_smem_layoutSFA(TiledMmaQK{}, TileShape_MNK{}));
-    using SmemLayoutAtomSFK = decltype(BlkScaledConfig::deduce_smem_layoutSFB(TiledMmaQK{}, TileShape_MNK{}));
-    using SmemLayoutAtomSFV = decltype(BlkScaledConfig::deduce_smem_layoutSFB(TiledMmaPV{}, TileShape_MNK{}));
+    using SmemLayoutAtomSFQ = decltype(BlkScaledConfig::deduce_smem_layoutSFQ(TiledMmaQK{}, TileShape_MNK{}));
+    using SmemLayoutAtomSFK = decltype(BlkScaledConfig::deduce_smem_layoutSFKV(TiledMmaQK{}, TileShape_MNK{}));
+    using SmemLayoutAtomSFV = decltype(BlkScaledConfig::deduce_smem_layoutSFKV(TiledMmaPV{}, TileShape_MNK{}));
+    using SmemLayoutAtomSFVt = decltype(BlkScaledConfig::deduce_smem_layoutSFVt(
+        TiledMmaPV{}, Shape<Int<kBlockM>, Int<kHeadDim>, Int<kBlockN>>{}));
 
     using LayoutSFP = decltype(
       make_layout(
@@ -184,13 +190,17 @@ struct Flash_fwd_kernel_traits_sm100 {
         append(shape(SmemLayoutAtomSFV{}), Int<kStages>{}),
         append(stride(SmemLayoutAtomSFV{}), size(filter_zeros(SmemLayoutAtomSFV{})))
       ));
+    using SmemLayoutSFVt = decltype(make_layout(
+        append(shape(SmemLayoutAtomSFVt{}), Int<kStages>{}),
+        append(stride(SmemLayoutAtomSFVt{}), size(filter_zeros(SmemLayoutAtomSFVt{})))
+      ));
 
     using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, ElementOut,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_MNK{}), Step<_1, _2>{}));
     using SharedStorage = SharedStorageQKVOwithSFSm100<kStages, EpiStages, Element, ElementSF, ElementOut,
-        SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutDS,
-        SmemLayoutO, SmemLayoutSFQ, SmemLayoutSFK, SmemLayoutSFV>;
+        SmemLayoutQ, SmemLayoutK, SmemLayoutVt, SmemLayoutDS,
+        SmemLayoutO, SmemLayoutSFQ, SmemLayoutSFK, SmemLayoutSFVt>;
     using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
     using PipelineState = typename cutlass::PipelineState<kStages>;
     using MainloopPipelineQ = cutlass::PipelineTmaAsync<1>;

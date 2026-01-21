@@ -39,7 +39,6 @@ void run_flash_fwd_sm100(Flash_fwd_params &params, cudaStream_t stream) {
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits>;
     using Scheduler = flash::StaticPersistentTileScheduler;
 
-    int d_sf = params.d / 16;
     typename CollectiveMainloop::Params mainloop_params =
         CollectiveMainloop::to_underlying_arguments({
             static_cast<Element const*>(params.q_ptr),
@@ -50,14 +49,14 @@ void run_flash_fwd_sm100(Flash_fwd_params &params, cudaStream_t stream) {
             {params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride},  // stride_K
             {params.unpadded_seqlen_k, params.d, params.h_k, params.b},  // shape_K
             static_cast<Element const*>(params.v_ptr),
-            {params.seqlen_k, params.d, params.h_k, params.b},  // shape_V
-            {params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride},  // stride_V
+            {params.d, params.seqlen_k, params.h_k, params.b},  // shape_Vt
+            {params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride},  // stride_Vt
             static_cast<ElementSF const*>(params.sfq_ptr),
-            {params.seqlen_q, d_sf, params.h * params.b},  // shape_SFQ (L = head*batch)
+            {params.seqlen_q, params.d, params.h, params.b},  // shape_SFQ
             static_cast<ElementSF const*>(params.sfk_ptr),
-            {params.seqlen_k, d_sf, params.h_k * params.b},  // shape_SFK (L = head*batch)
+            {params.seqlen_k, params.d, params.h_k, params.b},  // shape_SFK
             static_cast<ElementSF const*>(params.sfv_ptr),
-            {params.seqlen_k, d_sf, params.h_k * params.b},  // shape_SFV (L = head*batch)
+            {params.d, params.seqlen_k, params.h_k, params.b},  // shape_SFVt
             static_cast<float const*>(params.delta_s_ptr),
             {params.seqlen_s, params.seqlen_k, params.h_k, params.b},
             {params.ds_row_stride, _1{}, params.ds_head_stride, params.ds_batch_stride},

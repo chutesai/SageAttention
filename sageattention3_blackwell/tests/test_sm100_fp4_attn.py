@@ -68,11 +68,12 @@ def test_sm100_fp4_attention_matches_reference(head_dim, dtype, is_causal):
     q_p, k_p, v_p, delta_s = preprocess_qkv(q, k, v, per_block_mean=True)
     q_packed, q_sf = scale_and_quant_fp4_sm100(q_p)
     k_packed, k_sf = scale_and_quant_fp4_sm100(k_p)
-    v_packed, v_sf = scale_and_quant_fp4_sm100(v_p)
+    v_p_t = v_p.transpose(-2, -1).contiguous()
+    v_packed, v_sf = scale_and_quant_fp4_sm100(v_p_t)
 
     q_deq = _dequant_fp4_sm100(q_packed, q_sf)
     k_deq = _dequant_fp4_sm100(k_packed, k_sf)
-    v_deq = _dequant_fp4_sm100(v_packed, v_sf)
+    v_deq = _dequant_fp4_sm100(v_packed, v_sf).transpose(-2, -1).contiguous()
 
     softmax_scale = head_dim ** -0.5
     ref = _reference_attn(q_deq, k_deq, v_deq, delta_s, softmax_scale, is_causal, True)
@@ -96,11 +97,12 @@ def test_sm100_fp4_attention_per_block_mean_false():
     q_p, k_p, v_p, delta_s = preprocess_qkv(q, k, v, per_block_mean=False)
     q_packed, q_sf = scale_and_quant_fp4_sm100(q_p)
     k_packed, k_sf = scale_and_quant_fp4_sm100(k_p)
-    v_packed, v_sf = scale_and_quant_fp4_sm100(v_p)
+    v_p_t = v_p.transpose(-2, -1).contiguous()
+    v_packed, v_sf = scale_and_quant_fp4_sm100(v_p_t)
 
     q_deq = _dequant_fp4_sm100(q_packed, q_sf)
     k_deq = _dequant_fp4_sm100(k_packed, k_sf)
-    v_deq = _dequant_fp4_sm100(v_packed, v_sf)
+    v_deq = _dequant_fp4_sm100(v_packed, v_sf).transpose(-2, -1).contiguous()
 
     softmax_scale = head_dim ** -0.5
     ref = _reference_attn(q_deq, k_deq, v_deq, delta_s, softmax_scale, False, False)
