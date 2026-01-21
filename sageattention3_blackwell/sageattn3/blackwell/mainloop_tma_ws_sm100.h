@@ -492,14 +492,18 @@ struct CollectiveMainloopFwdSm100 {
         Tensor tKgK = group_modes<0, 3>(block_tma_k.partition_S(gK));
         Tensor tKsK = group_modes<0, 3>(block_tma_k.partition_D(sK));
         auto block_tma_sfk = mainloop_params.tma_load_SFK.get_slice(cluster_local_block_id.x);
-        Tensor tKgSFK = group_modes<0, 3>(block_tma_sfk.partition_S(gSFK));
-        Tensor tKsSFK = group_modes<0, 3>(block_tma_sfk.partition_D(sSFK));
+        auto [tKgSFK, tKsSFK] = tma_partition(
+            block_tma_sfk,
+            group_modes<0, 3>(sSFK),
+            group_modes<0, 3>(gSFK));
         auto block_tma_v = mainloop_params.tma_load_V.get_slice(cluster_local_block_id.x);
         Tensor tVgV = group_modes<0, 3>(block_tma_v.partition_S(gV));
         Tensor tVsV = group_modes<0, 3>(block_tma_v.partition_D(sV));
         auto block_tma_sfv = mainloop_params.tma_load_SFV.get_slice(cluster_local_block_id.x);
-        Tensor tVgSFV = group_modes<0, 3>(block_tma_sfv.partition_S(gSFV));
-        Tensor tVsSFV = group_modes<0, 3>(block_tma_sfv.partition_D(sSFV));
+        auto [tVgSFV, tVsSFV] = tma_partition(
+            block_tma_sfv,
+            group_modes<0, 3>(sSFV),
+            group_modes<0, 3>(gSFV));
         auto block_tma_ds = mainloop_params.tma_load_DS.get_slice(cluster_local_block_id.x);
         Tensor tDSgDS = group_modes<0, 3>(block_tma_ds.partition_S(gDS));
         Tensor tDSsDS = group_modes<0, 3>(block_tma_ds.partition_D(sDS));

@@ -51,7 +51,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     using TileShape_MNK = typename Ktraits::TileShape_MNK;
     using ClusterShape = typename Ktraits::ClusterShape_MNK;
 
-    static constexpr int NumMmaThreads = Ktraits::kNThreads;
+    static constexpr int NumMmaThreads = cutlass::NumThreadsPerWarpGroup;
     static constexpr int NumCopyThreads = cutlass::NumThreadsPerWarpGroup;
     static constexpr int kBlockM = Ktraits::kBlockM;
 
