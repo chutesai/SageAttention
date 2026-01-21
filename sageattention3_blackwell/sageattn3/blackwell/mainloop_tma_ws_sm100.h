@@ -61,7 +61,7 @@ struct CollectiveMainloopFwdSm100 {
         );
     using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
     using StrideQKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
-    using ShapeSF = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d // 16, head, batch)
+    using ShapeSF = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen, d // 16, head*batch)
     using LayoutSF = typename Ktraits::LayoutSF;
     using LayoutP = typename Ktraits::LayoutP;
     using LayoutSFP = typename Ktraits::LayoutSFP;
@@ -111,14 +111,14 @@ struct CollectiveMainloopFwdSm100 {
     using TMA_SFKV = decltype(make_tma_copy<uint16_t>(
         GmemTiledCopySF{},
         make_tensor(static_cast<ElementSF const*>(nullptr), LayoutSF{}),
-        SmemLayoutSFK{}(_,_,cute::Int<0>{}),
+        SmemLayoutSFK{}(_,_,_,_,_,cute::Int<0>{}),
         make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
         _1{}));
 
     using TMA_SFV = decltype(make_tma_copy<uint16_t>(
         GmemTiledCopySF{},
         make_tensor(static_cast<ElementSF const*>(nullptr), LayoutSF{}),
-        SmemLayoutSFV{}(_,_,cute::Int<0>{}),
+        SmemLayoutSFV{}(_,_,_,_,_,cute::Int<0>{}),
         make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
         _1{}));
 
@@ -240,7 +240,7 @@ struct CollectiveMainloopFwdSm100 {
         TMA_SFKV tma_load_sfk = make_tma_copy<uint16_t>(
             GmemTiledCopySF{},
             mSFK,
-            SmemLayoutSFK{}(_, _, _0{}),
+            SmemLayoutSFK{}(_, _, _, _, _, _0{}),
             make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
             _1{});
         LayoutSF layout_sfv = BlkScaledConfig::tile_atom_to_shape_SFB(args.shape_SFV);
@@ -248,7 +248,7 @@ struct CollectiveMainloopFwdSm100 {
         TMA_SFV tma_load_sfv = make_tma_copy<uint16_t>(
             GmemTiledCopySF{},
             mSFV,
-            SmemLayoutSFV{}(_, _, _0{}),
+            SmemLayoutSFV{}(_, _, _, _, _, _0{}),
             make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
             _1{});
         return {args.shape_Q, layout_sfq,
@@ -478,9 +478,10 @@ struct CollectiveMainloopFwdSm100 {
                             return local_tile(mDS(_, _, bidh, bidb), select<0, 1>(TileShape_MNK{}), make_coord(_0{}, _));
                         }
                     }();
-        Tensor gSFQ = local_tile(mSFQ(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
-        Tensor gSFK = local_tile(mSFK(_, _, bidh, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
-        Tensor gSFV = local_tile(mSFV(_, _, bidh, bidb), make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})), make_coord(_0{}, _));
+        int l = bidh + bidb * get<2>(mainloop_params.shape_Q);
+        Tensor gSFQ = local_tile(mSFQ(_, _, l), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
+        Tensor gSFK = local_tile(mSFK(_, _, l), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
+        Tensor gSFV = local_tile(mSFV(_, _, l), make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})), make_coord(_0{}, _));
         auto block_tma_q = mainloop_params.tma_load_Q.get_slice(_0{});
         Tensor tQgQ = block_tma_q.partition_S(gQ);
         Tensor tQsQ = block_tma_q.partition_D(sQ);

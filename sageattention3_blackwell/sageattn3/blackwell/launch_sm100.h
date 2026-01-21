@@ -53,11 +53,11 @@ void run_flash_fwd_sm100(Flash_fwd_params &params, cudaStream_t stream) {
             {params.seqlen_k, params.d, params.h_k, params.b},  // shape_V
             {params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride},  // stride_V
             static_cast<ElementSF const*>(params.sfq_ptr),
-            {params.seqlen_q, d_sf, params.h, params.b},  // shape_SFQ
+            {params.seqlen_q, d_sf, params.h * params.b},  // shape_SFQ (L = head*batch)
             static_cast<ElementSF const*>(params.sfk_ptr),
-            {params.seqlen_k, d_sf, params.h_k, params.b},  // shape_SFK
+            {params.seqlen_k, d_sf, params.h_k * params.b},  // shape_SFK (L = head*batch)
             static_cast<ElementSF const*>(params.sfv_ptr),
-            {params.seqlen_k, d_sf, params.h_k, params.b},  // shape_SFV
+            {params.seqlen_k, d_sf, params.h_k * params.b},  // shape_SFV (L = head*batch)
             static_cast<float const*>(params.delta_s_ptr),
             {params.seqlen_s, params.seqlen_k, params.h_k, params.b},
             {params.ds_row_stride, _1{}, params.ds_head_stride, params.ds_batch_stride},
