@@ -27,7 +27,7 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/collective/builders/sm100_common.inl"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
-#include "cute/arch/copy_sm100_tma.hpp"
+#include "cute/arch/copy_sm90_tma.hpp"
 #include "cute/arch/mma_sm100_umma.hpp"
 
 #include "blockscaled_layout.h"
@@ -127,8 +127,8 @@ struct Flash_fwd_kernel_traits_sm100 {
 
     static constexpr int MMA_NSF = size<2>(typename TiledMmaQK::AtomShape_MNK{}) / SFVectorSize;
 
-    using GmemTiledCopy = SM100_TMA_2SM_LOAD;
-    using GmemTiledCopySF = SM100_TMA_2SM_LOAD;
+    using GmemTiledCopy = SM90_TMA_LOAD;
+    using GmemTiledCopySF = SM90_TMA_LOAD;
 
     using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<UMMA::Major::K, Element,
         decltype(size<0>(TileShape_MNK{})), decltype(size<2>(TileShape_MNK{}))>());
