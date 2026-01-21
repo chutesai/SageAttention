@@ -14,432 +14,287 @@
  * limitations under the License.
  */
 
+// Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
 #include <torch/python.h>
+#include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-#include <cutlass/detail/sm100_blockscaled_layout.hpp>
-#include <cute/tensor.hpp>
+#include <cutlass/numeric_types.h>
 
-#include <cutlass/float_subbyte.h>
-
-#include <math.h>
-#include <type_traits>
+#include "params.h"
+#include "launch_sm100.h"
+#include "static_switch.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
+#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
-#define CHECK_LASTDIM_CONTIGUOUS(x) TORCH_CHECK(x.stride(-1) == 1, #x " must have contiguous last dim")
 
-__device__ __forceinline__ float fp4_to_float(uint8_t nibble) {
-    cutlass::float_e2m1_t fp4 = cutlass::float_e2m1_t::bitcast(nibble);
-    return float(fp4);
-}
 
-__device__ __forceinline__ float fp8_to_float(uint8_t byte) {
-    __nv_fp8_e4m3 fp8 = reinterpret_cast<__nv_fp8_e4m3&>(byte);
-    return float(fp8);
-}
+void set_params_fprop(Flash_fwd_params &params,
+                      // sizes
+                      const size_t b,
+                      const size_t seqlen_q,
+                      const size_t seqlen_k,
+                      const size_t unpadded_seqlen_k,
+                      const size_t seqlen_q_rounded,
+                      const size_t seqlen_k_rounded,
+                      const size_t h,
+                      const size_t h_k,
+                      const size_t d,
+                      const size_t d_rounded,
+                      // device pointers
+                      const at::Tensor q,
+                      const at::Tensor k,
+                      const at::Tensor v,
+                      const at::Tensor delta_s,
+                      at::Tensor out,
+                      const at::Tensor sfq,
+                      const at::Tensor sfk,
+                      const at::Tensor sfv,
+                      void *cu_seqlens_q_d,
+                      void *cu_seqlens_k_d,
+                      void *seqused_k,
+                      void *p_d,
+                      void *softmax_lse_d,
+                      float p_dropout,
+                      float softmax_scale,
+                      int window_size_left,
+                      int window_size_right,
+                      bool per_block_mean,
+                      bool is_bf16,
+                      bool seqlenq_ngroups_swapped=false) {
 
-__device__ __forceinline__ float load_fp4_scaled(const uint8_t* packed, const uint8_t* sf, int d,
-                                                 int token, int head_dim, int l,
-                                                 int seqlen, int total_l) {
-    uint8_t byte = packed[d >> 1];
-    uint8_t nibble = (d & 1) ? (byte >> 4) : (byte & 0xF);
-    float val = fp4_to_float(nibble);
-    using Sm100Config = cutlass::detail::Sm1xxBlockScaledConfig<16>;
-    auto layout_sfa = Sm100Config::tile_atom_to_shape_SFA(cute::make_shape(seqlen, head_dim / 16, total_l));
-    int k_coord = d >> 4;
-    int64_t offset = layout_sfa(cute::make_coord(token, k_coord, l));
-    float scale = fp8_to_float(sf[offset]);
-    return val * scale;
-}
+    params = {};
+    params.q_ptr = q.data_ptr();
+    params.k_ptr = k.data_ptr();
+    params.v_ptr = v.data_ptr();
+    params.delta_s_ptr = delta_s.data_ptr();
+    params.sfq_ptr = sfq.data_ptr();
+    params.sfk_ptr = sfk.data_ptr();
+    params.sfv_ptr = sfv.data_ptr();
 
-template <int HEAD_DIM, typename OutT>
-__global__ void fp4_attn_sm100_kernel(
-    const uint8_t* q,
-    const uint8_t* k,
-    const uint8_t* v,
-    const uint8_t* sfq,
-    const uint8_t* sfk,
-    const uint8_t* sfv,
-    const float* delta_s,
-    OutT* out,
-    float* softmax_lse,
-    int seqlen_q,
-    int seqlen_k,
-    int unpadded_k,
-    float softmax_scale,
-    bool is_causal,
-    bool per_block_mean,
-    int num_heads,
-    int total_l,
-    int64_t stride_qb,
-    int64_t stride_qh,
-    int64_t stride_qq,
-    int64_t stride_kb,
-    int64_t stride_kh,
-    int64_t stride_kk,
-    int64_t stride_vb,
-    int64_t stride_vh,
-    int64_t stride_vk,
-    int64_t stride_sfq_b,
-    int64_t stride_sfq_h,
-    int64_t stride_sfq_q,
-    int64_t stride_sfk_b,
-    int64_t stride_sfk_h,
-    int64_t stride_sfk_k,
-    int64_t stride_sfv_b,
-    int64_t stride_sfv_h,
-    int64_t stride_sfv_k,
-    int64_t stride_out_b,
-    int64_t stride_out_h,
-    int64_t stride_out_q,
-    int64_t stride_lse_b,
-    int64_t stride_lse_h,
-    int64_t stride_lse_q,
-    int64_t stride_ds_b,
-    int64_t stride_ds_h,
-    int64_t stride_ds_m,
-    int64_t stride_ds_k) {
-    constexpr int kBlockM = 128;
-    int q_idx = blockIdx.x * kBlockM + threadIdx.x;
-    if (q_idx >= seqlen_q) {
-        return;
-    }
+    params.q_row_stride = q.stride(-2) * 2;
+    params.k_row_stride = k.stride(-2) * 2;
+    params.v_row_stride = v.stride(-2) * 2;
+    params.q_head_stride = q.stride(-3) * 2;
+    params.k_head_stride = k.stride(-3) * 2;
+    params.v_head_stride = v.stride(-3) * 2;
 
-    int b = blockIdx.y;
-    int h = blockIdx.z;
-    int group_id = per_block_mean ? (q_idx / kBlockM) : 0;
+    params.ds_row_stride = delta_s.stride(-2);
+    params.ds_head_stride = delta_s.stride(-3);
 
-    const uint8_t* q_ptr = q + b * stride_qb + h * stride_qh + q_idx * stride_qq;
-    const uint8_t* sfq_ptr = sfq;
-    const float* ds_ptr = delta_s + b * stride_ds_b + h * stride_ds_h + group_id * stride_ds_m;
-    int l = b * num_heads + h;
+    params.sfq_row_stride = sfq.stride(-2);
+    params.sfk_row_stride = sfk.stride(-2);
+    params.sfv_row_stride = sfv.stride(-2);
+    params.sfq_head_stride = sfq.stride(-3);
+    params.sfk_head_stride = sfk.stride(-3);
+    params.sfv_head_stride = sfv.stride(-3);
+    params.o_ptr = out.data_ptr();
+    params.o_row_stride = out.stride(-2);
+    params.o_head_stride = out.stride(-3);
 
-    int max_k = is_causal ? (q_idx + 1 + seqlen_k - seqlen_q) : seqlen_k;
-    int k_limit = unpadded_k < max_k ? unpadded_k : max_k;
-    if (k_limit <= 0) {
-        OutT* out_ptr = out + b * stride_out_b + h * stride_out_h + q_idx * stride_out_q;
-        #pragma unroll
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            if constexpr (std::is_same<OutT, __half>::value) {
-                out_ptr[d] = __float2half_rn(0.0f);
-            } else {
-                out_ptr[d] = __float2bfloat16_rn(0.0f);
-            }
-        }
-        softmax_lse[b * stride_lse_b + h * stride_lse_h + q_idx * stride_lse_q] = INFINITY;
-        return;
-    }
-
-    float max_logit = -INFINITY;
-    for (int k_idx = 0; k_idx < k_limit; ++k_idx) {
-        const uint8_t* k_ptr = k + b * stride_kb + h * stride_kh + k_idx * stride_kk;
-        const uint8_t* sfk_ptr = sfk;
-        float acc = 0.0f;
-        #pragma unroll
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            float q_val = load_fp4_scaled(q_ptr, sfq_ptr, d, q_idx, HEAD_DIM, l, seqlen_q, total_l);
-            float k_val = load_fp4_scaled(k_ptr, sfk_ptr, d, k_idx, HEAD_DIM, l, seqlen_k, total_l);
-            acc += q_val * k_val;
-        }
-        acc = (acc + ds_ptr[k_idx * stride_ds_k]) * softmax_scale;
-        max_logit = acc > max_logit ? acc : max_logit;
-    }
-
-    float sum = 0.0f;
-    float out_acc[HEAD_DIM];
-    #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) {
-        out_acc[d] = 0.0f;
-    }
-
-    for (int k_idx = 0; k_idx < k_limit; ++k_idx) {
-        const uint8_t* k_ptr = k + b * stride_kb + h * stride_kh + k_idx * stride_kk;
-        const uint8_t* sfk_ptr = sfk;
-        const uint8_t* v_ptr = v + b * stride_vb + h * stride_vh + k_idx * stride_vk;
-        const uint8_t* sfv_ptr = sfv;
-        float acc = 0.0f;
-        #pragma unroll
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            float q_val = load_fp4_scaled(q_ptr, sfq_ptr, d, q_idx, HEAD_DIM, l, seqlen_q, total_l);
-            float k_val = load_fp4_scaled(k_ptr, sfk_ptr, d, k_idx, HEAD_DIM, l, seqlen_k, total_l);
-            acc += q_val * k_val;
-        }
-        acc = (acc + ds_ptr[k_idx * stride_ds_k]) * softmax_scale;
-        float w = expf(acc - max_logit);
-        sum += w;
-        #pragma unroll
-        for (int d = 0; d < HEAD_DIM; ++d) {
-            float v_val = load_fp4_scaled(v_ptr, sfv_ptr, d, k_idx, HEAD_DIM, l, seqlen_k, total_l);
-            out_acc[d] += w * v_val;
+    if (cu_seqlens_q_d == nullptr) {
+        params.q_batch_stride = q.stride(0) * 2;
+        params.k_batch_stride = k.stride(0) * 2;
+        params.v_batch_stride = v.stride(0) * 2;
+        params.ds_batch_stride = delta_s.stride(0);
+        params.sfq_batch_stride = sfq.stride(0);
+        params.sfk_batch_stride = sfk.stride(0);
+        params.sfv_batch_stride = sfv.stride(0);
+        params.o_batch_stride = out.stride(0);
+        if (seqlenq_ngroups_swapped) {
+             params.q_batch_stride *= seqlen_q;
+             params.o_batch_stride *= seqlen_q;
         }
     }
 
-    float inv_sum = (sum == 0.0f) ? 0.0f : 1.0f / sum;
-    OutT* out_ptr = out + b * stride_out_b + h * stride_out_h + q_idx * stride_out_q;
-    #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) {
-        float out_val = out_acc[d] * inv_sum;
-        if constexpr (std::is_same<OutT, __half>::value) {
-            out_ptr[d] = __float2half_rn(out_val);
-        } else {
-            out_ptr[d] = __float2bfloat16_rn(out_val);
-        }
-    }
+    params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
+    params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
+    params.seqused_k = static_cast<int *>(seqused_k);
 
-    float lse = (sum == 0.0f) ? INFINITY : max_logit + logf(sum);
-    softmax_lse[b * stride_lse_b + h * stride_lse_h + q_idx * stride_lse_q] = lse;
-}
+    params.p_ptr = p_d;
+    params.softmax_lse_ptr = softmax_lse_d;
 
-template <typename OutT>
-void run_fp4_attn_sm100(
-    const at::Tensor& q,
-    const at::Tensor& k,
-    const at::Tensor& v,
-    const at::Tensor& sfq,
-    const at::Tensor& sfk,
-    const at::Tensor& sfv,
-    const at::Tensor& delta_s,
-    at::Tensor& out,
-    at::Tensor& softmax_lse,
-    int unpadded_k,
-    float softmax_scale,
-    bool is_causal,
-    bool per_block_mean) {
-    const int seqlen_q = q.size(2);
-    const int seqlen_k = k.size(2);
-    constexpr int kBlockM = 128;
-    dim3 block(kBlockM, 1, 1);
-    dim3 grid((seqlen_q + kBlockM - 1) / kBlockM, q.size(0), q.size(1));
+    params.b = b;
+    params.h = h;
+    params.h_k = h_k;
+    params.h_h_k_ratio = h / h_k;
+    params.seqlen_q = seqlen_q;
+    params.seqlen_k = seqlen_k;
+    params.unpadded_seqlen_k = unpadded_seqlen_k;
+    params.seqlen_q_rounded = seqlen_q_rounded;
+    params.seqlen_k_rounded = seqlen_k_rounded;
+    params.d = d;
+    params.d_rounded = d_rounded;
 
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    params.head_divmod = cutlass::FastDivmod(int(h));
 
-    int64_t stride_qb = q.stride(0);
-    int64_t stride_qh = q.stride(1);
-    int64_t stride_qq = q.stride(2);
-    int64_t stride_kb = k.stride(0);
-    int64_t stride_kh = k.stride(1);
-    int64_t stride_kk = k.stride(2);
-    int64_t stride_vb = v.stride(0);
-    int64_t stride_vh = v.stride(1);
-    int64_t stride_vk = v.stride(2);
-    int64_t stride_sfq_b = sfq.stride(0);
-    int64_t stride_sfq_h = sfq.stride(1);
-    int64_t stride_sfq_q = sfq.stride(2);
-    int64_t stride_sfk_b = sfk.stride(0);
-    int64_t stride_sfk_h = sfk.stride(1);
-    int64_t stride_sfk_k = sfk.stride(2);
-    int64_t stride_sfv_b = sfv.stride(0);
-    int64_t stride_sfv_h = sfv.stride(1);
-    int64_t stride_sfv_k = sfv.stride(2);
-    int64_t stride_out_b = out.stride(0);
-    int64_t stride_out_h = out.stride(1);
-    int64_t stride_out_q = out.stride(2);
-    int64_t stride_lse_b = softmax_lse.stride(0);
-    int64_t stride_lse_h = softmax_lse.stride(1);
-    int64_t stride_lse_q = softmax_lse.stride(2);
-    int64_t stride_ds_b = delta_s.stride(0);
-    int64_t stride_ds_h = delta_s.stride(1);
-    int64_t stride_ds_m = delta_s.stride(2);
-    int64_t stride_ds_k = delta_s.stride(3);
+    params.scale_softmax = softmax_scale;
+    params.scale_softmax_log2 = softmax_scale * M_LOG2E;
+    __half scale_softmax_log2_half = __float2half(params.scale_softmax_log2);
+    __half2 scale_softmax_log2_half2 = __half2(scale_softmax_log2_half, scale_softmax_log2_half);
+    params.scale_softmax_log2_half2 = reinterpret_cast<uint32_t&>(scale_softmax_log2_half2);
 
-    int head_dim = q.size(3) * 2;
-    if (head_dim == 64) {
-        fp4_attn_sm100_kernel<64, OutT><<<grid, block, 0, stream>>>(
-            reinterpret_cast<const uint8_t*>(q.data_ptr()),
-            reinterpret_cast<const uint8_t*>(k.data_ptr()),
-            reinterpret_cast<const uint8_t*>(v.data_ptr()),
-            reinterpret_cast<const uint8_t*>(sfq.data_ptr()),
-            reinterpret_cast<const uint8_t*>(sfk.data_ptr()),
-            reinterpret_cast<const uint8_t*>(sfv.data_ptr()),
-            reinterpret_cast<const float*>(delta_s.data_ptr()),
-            reinterpret_cast<OutT*>(out.data_ptr()),
-            reinterpret_cast<float*>(softmax_lse.data_ptr()),
-            seqlen_q,
-            seqlen_k,
-            unpadded_k,
-            softmax_scale,
-            is_causal,
-            per_block_mean,
-            q.size(1),
-            q.size(0) * q.size(1),
-            stride_qb,
-            stride_qh,
-            stride_qq,
-            stride_kb,
-            stride_kh,
-            stride_kk,
-            stride_vb,
-            stride_vh,
-            stride_vk,
-            stride_sfq_b,
-            stride_sfq_h,
-            stride_sfq_q,
-            stride_sfk_b,
-            stride_sfk_h,
-            stride_sfk_k,
-            stride_sfv_b,
-            stride_sfv_h,
-            stride_sfv_k,
-            stride_out_b,
-            stride_out_h,
-            stride_out_q,
-            stride_lse_b,
-            stride_lse_h,
-            stride_lse_q,
-            stride_ds_b,
-            stride_ds_h,
-            stride_ds_m,
-            stride_ds_k);
-    } else if (head_dim == 128) {
-        fp4_attn_sm100_kernel<128, OutT><<<grid, block, 0, stream>>>(
-            reinterpret_cast<const uint8_t*>(q.data_ptr()),
-            reinterpret_cast<const uint8_t*>(k.data_ptr()),
-            reinterpret_cast<const uint8_t*>(v.data_ptr()),
-            reinterpret_cast<const uint8_t*>(sfq.data_ptr()),
-            reinterpret_cast<const uint8_t*>(sfk.data_ptr()),
-            reinterpret_cast<const uint8_t*>(sfv.data_ptr()),
-            reinterpret_cast<const float*>(delta_s.data_ptr()),
-            reinterpret_cast<OutT*>(out.data_ptr()),
-            reinterpret_cast<float*>(softmax_lse.data_ptr()),
-            seqlen_q,
-            seqlen_k,
-            unpadded_k,
-            softmax_scale,
-            is_causal,
-            per_block_mean,
-            q.size(1),
-            q.size(0) * q.size(1),
-            stride_qb,
-            stride_qh,
-            stride_qq,
-            stride_kb,
-            stride_kh,
-            stride_kk,
-            stride_vb,
-            stride_vh,
-            stride_vk,
-            stride_sfq_b,
-            stride_sfq_h,
-            stride_sfq_q,
-            stride_sfk_b,
-            stride_sfk_h,
-            stride_sfk_k,
-            stride_sfv_b,
-            stride_sfv_h,
-            stride_sfv_k,
-            stride_out_b,
-            stride_out_h,
-            stride_out_q,
-            stride_lse_b,
-            stride_lse_h,
-            stride_lse_q,
-            stride_ds_b,
-            stride_ds_h,
-            stride_ds_m,
-            stride_ds_k);
+    params.p_dropout = 1.f - p_dropout;
+    params.p_dropout_in_uint8_t = uint8_t(std::floor(params.p_dropout * 255.0));
+    params.rp_dropout = 1.f / params.p_dropout;
+    params.scale_softmax_rp_dropout = params.rp_dropout * params.scale_softmax;
+    TORCH_CHECK(p_dropout < 1.f);
+    #ifdef FLASHATTENTION_DISABLE_DROPOUT
+        TORCH_CHECK(p_dropout == 0.0f, "This flash attention build does not support dropout.");
+    #endif
+
+    params.is_causal = window_size_left < 0 && window_size_right == 0;
+    params.per_block_mean = per_block_mean;
+    if (per_block_mean) {
+        params.seqlen_s = seqlen_q;
     } else {
-        TORCH_CHECK(false, "Unsupported head dim: ", head_dim);
+        params.seqlen_s = 128;
     }
+    if (window_size_left < 0 && window_size_right >= 0) { window_size_left = seqlen_k; }
+    if (window_size_left >= 0 && window_size_right < 0) { window_size_right = seqlen_k; }
+    params.window_size_left = window_size_left;
+    params.window_size_right = window_size_right;
+
+    #ifdef FLASHATTENTION_DISABLE_LOCAL
+        TORCH_CHECK(params.is_causal || (window_size_left < 0 && window_size_right < 0),
+            "This flash attention build does not support local attention.");
+    #endif
+
+    params.is_seqlens_k_cumulative = true;
+    params.is_bf16 = is_bf16;
+    #ifdef FLASHATTENTION_DISABLE_UNEVEN_K
+        TORCH_CHECK(d == d_rounded, "This flash attention build does not support headdim not being a multiple of 32.");
+    #endif
+}
+
+template<bool IsBF16>
+void run_mha_fwd_dispatch_dtype_sm100(Flash_fwd_params &params, cudaStream_t stream) {
+    using OType = std::conditional_t<IsBF16, cutlass::bfloat16_t, cutlass::half_t>;
+    if (params.d == 64) {
+        run_mha_fwd_sm100_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, 64, OType>(params, stream);
+    } else if (params.d == 128) {
+        run_mha_fwd_sm100_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, 128, OType>(params, stream);
+    }
+}
+
+void run_mha_fwd_sm100(Flash_fwd_params &params, cudaStream_t stream) {
+    BOOL_SWITCH(params.is_bf16, IsBF16, ([&] {
+        run_mha_fwd_dispatch_dtype_sm100<IsBF16>(params, stream);
+    }));
 }
 
 std::vector<at::Tensor>
-mha_fwd_sm100(
-    at::Tensor &q,
-    const at::Tensor &k,
-    const at::Tensor &v,
-    const at::Tensor &sfq,
-    const at::Tensor &sfk,
-    const at::Tensor &sfv,
-    const at::Tensor &delta_s,
-    int unpadded_k,
-    c10::optional<at::Tensor> &out_,
-    const float softmax_scale,
-    bool is_causal,
-    bool per_block_mean,
-    bool is_bf16) {
-    (void)out_;
+mha_fwd(at::Tensor &q,
+        const at::Tensor &k,
+        const at::Tensor &v,
+        const at::Tensor &sfq,
+        const at::Tensor &sfk,
+        const at::Tensor &sfv,
+        const at::Tensor &delta_s,
+        int unpadded_k,
+        c10::optional<at::Tensor> &out_,
+        const float softmax_scale,
+        bool is_causal,
+        bool per_block_mean,
+        bool is_bf16
+    ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm100 = dprops->major == 10 && dprops->minor == 0;
-    TORCH_CHECK(is_sm100, "only supports Blackwell SM100 GPUs.");
+    TORCH_CHECK(is_sm100, "only supports SM100 GPUs.");
 
-    TORCH_CHECK(q.dtype() == torch::kUInt8, "q dtype must be uint8");
-    TORCH_CHECK(k.dtype() == q.dtype(), "query and key must have the same dtype");
-    TORCH_CHECK(v.dtype() == q.dtype(), "query and value must have the same dtype");
-    TORCH_CHECK(sfq.dtype() == torch::kFloat8_e4m3fn, "sfq dtype must be float8_e4m3fn");
-    TORCH_CHECK(sfk.dtype() == sfq.dtype(), "sfq and sfk must have the same dtype");
-    TORCH_CHECK(sfv.dtype() == sfq.dtype(), "sfq and sfv must have the same dtype");
-    TORCH_CHECK(delta_s.dtype() == torch::kFloat, "delta_s must be float32");
+    auto q_dtype = q.dtype();
+    auto sfq_dtype = sfq.dtype();
+    TORCH_CHECK(q_dtype == torch::kUInt8, "q dtype must be uint8");
+    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
 
-    CHECK_DEVICE(q);
-    CHECK_DEVICE(k);
-    CHECK_DEVICE(v);
-    CHECK_DEVICE(sfq);
-    CHECK_DEVICE(sfk);
-    CHECK_DEVICE(sfv);
-    CHECK_DEVICE(delta_s);
+    TORCH_CHECK(sfq_dtype == torch::kFloat8_e4m3fn, "sf dtype must be float8 e4m3fn");
+    TORCH_CHECK(sfk.dtype() == sfq_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(sfv.dtype() == sfq_dtype, "query and value must have the same dtype");
+    CHECK_DEVICE(sfq); CHECK_DEVICE(sfk); CHECK_DEVICE(sfv);
 
-    CHECK_LASTDIM_CONTIGUOUS(q);
-    CHECK_LASTDIM_CONTIGUOUS(k);
-    CHECK_LASTDIM_CONTIGUOUS(v);
-    CHECK_LASTDIM_CONTIGUOUS(sfq);
-    CHECK_LASTDIM_CONTIGUOUS(sfk);
-    CHECK_LASTDIM_CONTIGUOUS(sfv);
-    CHECK_LASTDIM_CONTIGUOUS(delta_s);
+    TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(delta_s.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
-    CHECK_CONTIGUOUS(q);
-    CHECK_CONTIGUOUS(k);
-    CHECK_CONTIGUOUS(v);
-    CHECK_CONTIGUOUS(sfq);
-    CHECK_CONTIGUOUS(sfk);
-    CHECK_CONTIGUOUS(sfv);
-    CHECK_CONTIGUOUS(delta_s);
+    TORCH_CHECK(q.is_contiguous(), "Input tensor must be contiguous");
+    TORCH_CHECK(k.is_contiguous(), "Input tensor must be contiguous");
+    TORCH_CHECK(v.is_contiguous(), "Input tensor must be contiguous");
 
     const auto sizes = q.sizes();
+    auto opts = q.options();
     const int batch_size = sizes[0];
-    const int num_heads = sizes[1];
-    const int seqlen_q = sizes[2];
+    int seqlen_q = sizes[2];
+    int num_heads = sizes[1];
     const int head_size_og = sizes[3];
     const int unpacked_head_size = head_size_og * 2;
     const int seqlen_k = k.size(2);
     const int num_heads_k = k.size(1);
 
-    TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    TORCH_CHECK(batch_size > 0, "batch size must be postive");
+    TORCH_CHECK(unpacked_head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
+    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
     TORCH_CHECK(num_heads == num_heads_k, "We do not support MQA/GQA yet");
-    TORCH_CHECK(unpacked_head_size == 64 || unpacked_head_size == 128,
-                "Only support head size 64 and 128 for SM100");
 
-    TORCH_CHECK(q.size(0) == k.size(0) && q.size(0) == v.size(0), "batch size mismatch");
-    TORCH_CHECK(q.size(1) == k.size(1) && q.size(1) == v.size(1), "head count mismatch");
-    TORCH_CHECK(q.size(3) == k.size(3) && q.size(3) == v.size(3), "head dim mismatch");
-    TORCH_CHECK(k.size(2) == v.size(2), "key/value sequence length mismatch");
+    TORCH_CHECK(unpacked_head_size == 64 || unpacked_head_size == 128, "Only support head size 64, and 128 for now");
+
+    CHECK_SHAPE(q, batch_size, num_heads, seqlen_q, head_size_og);
+    CHECK_SHAPE(k, batch_size, num_heads_k, seqlen_k, head_size_og);
+    CHECK_SHAPE(v, batch_size, num_heads_k, seqlen_k, head_size_og);
+    TORCH_CHECK(unpacked_head_size % 8 == 0, "head_size must be a multiple of 8");
 
     auto dtype = is_bf16 ? at::ScalarType::BFloat16 : at::ScalarType::Half;
-    auto opts = q.options();
     at::Tensor out = torch::empty({batch_size, num_heads, seqlen_q, unpacked_head_size}, opts.dtype(dtype));
-    at::Tensor softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
+    const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
-    if (is_bf16) {
-        run_fp4_attn_sm100<__nv_bfloat16>(
-            q, k, v, sfq, sfk, sfv, delta_s,
-            out, softmax_lse, unpadded_k, softmax_scale, is_causal, per_block_mean);
+    auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    at::Tensor p;
+
+    Flash_fwd_params params;
+    set_params_fprop(params,
+                     batch_size,
+                     seqlen_q, seqlen_k, unpadded_k,
+                     seqlen_q_rounded, seqlen_k_rounded,
+                     num_heads, num_heads_k,
+                     unpacked_head_size, unpacked_head_size,
+                     q, k, v, delta_s, out,
+                     sfq, sfk, sfv,
+                     /*cu_seqlens_q_d=*/nullptr,
+                     /*cu_seqlens_k_d=*/nullptr,
+                     /*seqused_k=*/nullptr,
+                     nullptr,
+                     softmax_lse.data_ptr(),
+                     /*p_dropout=*/0.f,
+                     softmax_scale,
+                     /*window_size_left=*/-1,
+                     /*window_size_right=*/is_causal ? 0 : -1,
+                     per_block_mean,
+                     is_bf16
+                    );
+    auto tile_count_semaphore = is_causal ? torch::full({1}, 132, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
+    params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+
+    if (seqlen_k > 0) {
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        run_mha_fwd_sm100(params, stream);
     } else {
-        run_fp4_attn_sm100<__half>(
-            q, k, v, sfq, sfk, sfv, delta_s,
-            out, softmax_lse, unpadded_k, softmax_scale, is_causal, per_block_mean);
+        out.zero_();
+        softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
     return {out, softmax_lse};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FP4 Attention SM100";
-    m.def("fwd", &mha_fwd_sm100, "Forward pass");
+    m.def("fwd", &mha_fwd, "FP4 attention forward (SM100)");
 }
