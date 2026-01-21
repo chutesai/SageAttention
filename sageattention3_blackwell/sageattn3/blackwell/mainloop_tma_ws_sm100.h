@@ -658,8 +658,8 @@ struct CollectiveMainloopFwdSm100 {
         Tensor tOrV = thread_mma_pv.partition_fragment_B(recast<ElementKMma>(sVt(_,_,Int<0>{})));
         Tensor tOrP = make_tensor_like<Element>(LayoutP{});
         Tensor tSrSFQ = partition_fragment_SFA(sSFQ, thread_mma_qk);
-        Tensor tSrSFK = partition_fragment_SFB(sSFK(_,_,_,Int<0>{}), thread_mma_qk);
-        Tensor tOrSFV = partition_fragment_SFB(sSFVt(_,_,_,Int<0>{}), thread_mma_pv);
+        Tensor tSrSFK = partition_fragment_SFB(sSFK(_,_,Int<0>{}), thread_mma_qk);
+        Tensor tOrSFV = partition_fragment_SFB(sSFVt(_,_,Int<0>{}), thread_mma_pv);
         Tensor tOrSFP = make_tensor<ElementSF>(LayoutSFP{});
         Tensor tOrSFP_flt = filter_zeros(tOrSFP);
         Tensor tSrDS = make_tensor<float>(make_shape(_8{}, _4{}), make_stride(_1{}, _8{}));
