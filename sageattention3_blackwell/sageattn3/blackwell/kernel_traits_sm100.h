@@ -152,8 +152,8 @@ struct Flash_fwd_kernel_traits_sm100 {
         decltype(tile_to_shape(SmemLayoutAtomDS{},
             make_shape(shape<0>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{})));
 
-    using SmemCopyAtomQ = Copy_Atom<SM100_SU4_DU8x16_x4_LDSM_N, Element>;
-    using SmemCopyAtomKV = Copy_Atom<SM100_SU4_DU8x16_x4_LDSM_N, Element>;
+    using SmemCopyAtomQ = Copy_Atom<UniversalCopy<Element>, Element>;
+    using SmemCopyAtomKV = Copy_Atom<UniversalCopy<Element>, Element>;
     using SmemCopyAtomSF = Copy_Atom<UniversalCopy<ElementSF>, ElementSF>;
     using SmemCopyAtomDS = Copy_Atom<UniversalCopy<float>, float>;
 
