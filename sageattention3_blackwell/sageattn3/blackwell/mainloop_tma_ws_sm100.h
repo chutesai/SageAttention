@@ -364,7 +364,7 @@ struct CollectiveMainloopFwdSm100 {
     auto
     partition_fragment_SFA(SFATensor&& sfatensor, ThrMma& thread_mma)
     {
-      using ValTypeSF = typename ThrMma::Atom::Traits::ValTypeSF;
+      using ValTypeSF = typename ThrMma::Atom::Traits::ValTypeSFA;
       auto thr_tensor = make_tensor(static_cast<SFATensor&&>(sfatensor).data(), thrfrg_SFA(sfatensor.layout(),thread_mma));
       auto thr_vmnk = thread_mma.thr_vmnk_;
       auto thr_vmk = make_coord(get<0>(thr_vmnk), make_coord(get<1>(thr_vmnk), get<3>(thr_vmnk)));
@@ -377,7 +377,7 @@ struct CollectiveMainloopFwdSm100 {
     auto
     partition_fragment_SFB(SFBTensor&& sfbtensor, ThrMma& thread_mma)
     {
-      using ValTypeSF = typename ThrMma::Atom::Traits::ValTypeSF;
+      using ValTypeSF = typename ThrMma::Atom::Traits::ValTypeSFB;
       auto thr_tensor = make_tensor(static_cast<SFBTensor&&>(sfbtensor).data(), thrfrg_SFB(sfbtensor.layout(),thread_mma));
       auto thr_vmnk = thread_mma.thr_vmnk_;
       auto thr_vnk = make_coord(get<0>(thr_vmnk), make_coord(get<2>(thr_vmnk), get<3>(thr_vmnk)));
