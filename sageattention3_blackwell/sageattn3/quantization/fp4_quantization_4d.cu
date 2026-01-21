@@ -30,6 +30,7 @@
 #include "cuda_utils.h"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cute/tensor.hpp"
+#include "cutlass/float_subbyte.h"
 
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                \
   if (pytorch_dtype == at::ScalarType::Half) {                                          \
@@ -624,17 +625,8 @@ void scaled_fp4_quant_sm100(torch::Tensor const& input,
 }
 
 __device__ __forceinline__ float fp4_e2m1_to_float(uint8_t v) {
-  int sign = (v >> 3) & 0x1;
-  int exp = (v >> 1) & 0x3;
-  int mant = v & 0x1;
-  float mant_f = 0.5f * static_cast<float>(mant);
-  float val = 0.0f;
-  if (exp == 0) {
-    val = mant_f;
-  } else {
-    val = ldexpf(1.0f + mant_f, exp - 1);
-  }
-  return sign ? -val : val;
+  cutlass::float_e2m1_t fp4 = cutlass::float_e2m1_t::bitcast(v);
+  return float(fp4);
 }
 
 template <uint32_t head_dim, typename OutType>
