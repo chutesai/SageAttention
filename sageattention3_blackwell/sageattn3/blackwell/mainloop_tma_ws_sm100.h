@@ -20,6 +20,7 @@
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
+#include <type_traits>
 #include "cutlass/pipeline/pipeline.hpp"
 
 #include "cute/tensor.hpp"
@@ -290,15 +291,30 @@ struct CollectiveMainloopFwdSm100 {
         return n_block_max;
     }
 
+    template <class T, class = void>
+    struct has_sfa_layout : std::false_type {};
+
+    template <class T>
+    struct has_sfa_layout<T, std::void_t<typename T::SFALayout>> : std::true_type {};
+
+    template <class T, class = void>
+    struct has_sfb_layout : std::false_type {};
+
+    template <class T>
+    struct has_sfb_layout<T, std::void_t<typename T::SFBLayout>> : std::true_type {};
+
     template <class SFATensor, class Atom, class TiledThr, class TiledPerm>
     CUTE_HOST_DEVICE constexpr
     auto
     thrfrg_SFA(SFATensor&& sfatensor, TiledMMA<Atom, TiledThr, TiledPerm>& mma)
     {
       CUTE_STATIC_ASSERT_V(rank(sfatensor) >= Int<2>{});
-  
+
       using AtomShape_MNK  = typename Atom::Shape_MNK;
-      using AtomLayoutSFA_TV = typename Atom::Traits::SFALayout;
+      using AtomLayoutSFA_TV = std::conditional_t<
+          has_sfa_layout<typename Atom::Traits>::value,
+          typename Atom::Traits::SFALayout,
+          typename Atom::Traits::ALayout>;
   
       auto permutation_mnk = TiledPerm{};
       auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
@@ -331,9 +347,12 @@ struct CollectiveMainloopFwdSm100 {
     thrfrg_SFB(SFBTensor&& sfbtensor, TiledMMA<Atom, TiledThr, TiledPerm>& mma)
     {
       CUTE_STATIC_ASSERT_V(rank(sfbtensor) >= Int<2>{});
-  
+
       using AtomShape_MNK  = typename Atom::Shape_MNK;
-      using AtomLayoutSFB_TV = typename Atom::Traits::SFBLayout;
+      using AtomLayoutSFB_TV = std::conditional_t<
+          has_sfb_layout<typename Atom::Traits>::value,
+          typename Atom::Traits::SFBLayout,
+          typename Atom::Traits::BLayout>;
   
       auto permutation_mnk = TiledPerm{};
       auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
