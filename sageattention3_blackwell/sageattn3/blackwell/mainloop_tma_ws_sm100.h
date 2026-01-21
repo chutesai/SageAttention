@@ -235,7 +235,7 @@ struct CollectiveMainloopFwdSm100 {
             SmemLayoutSFQ{},
             make_shape(shape<0>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
             _1{});
-        LayoutSF layout_sfk = BlkScaledConfig::tile_atom_to_shape_SFA(args.shape_SFK);
+        LayoutSF layout_sfk = BlkScaledConfig::tile_atom_to_shape_SFB(args.shape_SFK);
         Tensor mSFK = make_tensor(make_gmem_ptr(args.ptr_SFK), layout_sfk);
         TMA_SFKV tma_load_sfk = make_tma_copy<uint16_t>(
             GmemTiledCopySF{},
@@ -492,14 +492,14 @@ struct CollectiveMainloopFwdSm100 {
         Tensor tKgK = group_modes<0, 3>(block_tma_k.partition_S(gK));
         Tensor tKsK = group_modes<0, 3>(block_tma_k.partition_D(sK));
         auto block_tma_sfk = mainloop_params.tma_load_SFK.get_slice(cluster_local_block_id.x);
-        Tensor tKgSFK = group_modes<0, 3>(block_tma_sfk.partition_S(gSFK));
-        Tensor tKsSFK = group_modes<0, 3>(block_tma_sfk.partition_D(sSFK));
+        Tensor tKgSFK = block_tma_sfk.partition_S(gSFK);
+        Tensor tKsSFK = block_tma_sfk.partition_D(sSFK);
         auto block_tma_v = mainloop_params.tma_load_V.get_slice(cluster_local_block_id.x);
         Tensor tVgV = group_modes<0, 3>(block_tma_v.partition_S(gV));
         Tensor tVsV = group_modes<0, 3>(block_tma_v.partition_D(sV));
         auto block_tma_sfv = mainloop_params.tma_load_SFV.get_slice(cluster_local_block_id.x);
-        Tensor tVgSFV = group_modes<0, 3>(block_tma_sfv.partition_S(gSFV));
-        Tensor tVsSFV = group_modes<0, 3>(block_tma_sfv.partition_D(sSFV));
+        Tensor tVgSFV = block_tma_sfv.partition_S(gSFV);
+        Tensor tVsSFV = block_tma_sfv.partition_D(sSFV);
         auto block_tma_ds = mainloop_params.tma_load_DS.get_slice(cluster_local_block_id.x);
         Tensor tDSgDS = group_modes<0, 3>(block_tma_ds.partition_S(gDS));
         Tensor tDSsDS = group_modes<0, 3>(block_tma_ds.partition_D(sDS));
