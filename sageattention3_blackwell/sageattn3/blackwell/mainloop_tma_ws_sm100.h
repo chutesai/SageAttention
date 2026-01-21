@@ -111,7 +111,7 @@ struct CollectiveMainloopFwdSm100 {
     using TMA_SFKV = decltype(make_tma_copy<uint16_t>(
         GmemTiledCopySF{},
         make_tensor(static_cast<ElementSF const*>(nullptr), LayoutSF{}),
-        SmemLayoutSFK{}(_,_,cute::Int<0>{}),
+        SmemLayoutSFK{}(make_coord(_, _), make_coord(_, _, _), cute::Int<0>{}),
         make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
         _1{}));
 
@@ -240,7 +240,7 @@ struct CollectiveMainloopFwdSm100 {
         TMA_SFKV tma_load_sfk = make_tma_copy<uint16_t>(
             GmemTiledCopySF{},
             mSFK,
-            SmemLayoutSFK{}(_, _, _0{}),
+            SmemLayoutSFK{}(make_coord(_, _), make_coord(_, _, _), _0{}),
             make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
             _1{});
         LayoutSF layout_sfvt = BlkScaledConfig::tile_atom_to_shape_SFVt(args.shape_SFVt);
