@@ -114,10 +114,14 @@ if not SKIP_CUDA_BUILD:
         cutlass_dir / "tools" / "util" / "include",
     ]
 
+    attn_source = "sageattn3/blackwell/api.cu"
+    if (cc_major, cc_minor) == (10, 0):
+        attn_source = "sageattn3/blackwell/api_sm100.cu"
+
     ext_modules.append(
         CUDAExtension(
             name="fp4attn_cuda",
-            sources=["sageattn3/blackwell/api.cu"],
+            sources=[attn_source],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
                 "nvcc": append_nvcc_threads(

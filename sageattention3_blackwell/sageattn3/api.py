@@ -99,6 +99,14 @@ def scale_and_quant_fp4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     fp4quant_cuda.scaled_fp4_quant(x, packed_fp4, fp8_scale, 1)
     return packed_fp4, fp8_scale
 
+def scale_and_quant_fp4_sm100(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.ndim == 4
+    B, H, N, D = x.shape
+    packed_fp4 = torch.empty((B, H, N, D // 2), device=x.device, dtype=torch.uint8)
+    fp8_scale = torch.empty((B, H, N, D // 16), device=x.device, dtype=torch.float8_e4m3fn)
+    fp4quant_cuda.scaled_fp4_quant_sm100(x, packed_fp4, fp8_scale)
+    return packed_fp4, fp8_scale
+
 def scale_and_quant_fp4_permute(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.ndim == 4
     B, H, N, D = x.shape
@@ -136,9 +144,16 @@ def sageattn3_blackwell(q, k, v, attn_mask = None, is_causal = False, per_block_
     KL = k.size(2)
     is_bf16 = q.dtype == torch.bfloat16
     q, k, v, delta_s = preprocess_qkv(q, k, v, per_block_mean)
-    qlist_from_cuda = scale_and_quant_fp4(q)
-    klist_from_cuda = scale_and_quant_fp4_permute(k)
-    vlist_from_cuda = scale_and_quant_fp4_transpose(v)
+    cc_major, cc_minor = torch.cuda.get_device_capability(q.device)
+    is_sm100 = cc_major == 10 and cc_minor == 0
+    if is_sm100:
+        qlist_from_cuda = scale_and_quant_fp4_sm100(q)
+        klist_from_cuda = scale_and_quant_fp4_sm100(k)
+        vlist_from_cuda = scale_and_quant_fp4_sm100(v)
+    else:
+        qlist_from_cuda = scale_and_quant_fp4(q)
+        klist_from_cuda = scale_and_quant_fp4_permute(k)
+        vlist_from_cuda = scale_and_quant_fp4_transpose(v)
     o_fp4 = blockscaled_fp4_attn(
     qlist_from_cuda,
     klist_from_cuda, 
