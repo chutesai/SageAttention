@@ -37,6 +37,8 @@ struct CollectiveMainloopFwdSm100 {
 
     using Element = typename Ktraits::Element;
     using ElementSF = typename Ktraits::ElementSF;
+    using ElementQMma = typename Ktraits::ElementQMma;
+    using ElementKMma = typename Ktraits::ElementKMma;
     // using TMAElement = Element;
     // using TMAElementSF = typename Ktraits::ElementSF;
     using TileShape_MNK = typename Ktraits::TileShape_MNK;
@@ -608,9 +610,9 @@ struct CollectiveMainloopFwdSm100 {
         auto thread_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
         auto thread_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx);
 
-        Tensor tSrQ = thread_mma_qk.partition_fragment_A(sQ);
-        Tensor tSrK = thread_mma_qk.partition_fragment_B(sK(_,_,Int<0>{}));
-        Tensor tOrV = thread_mma_pv.partition_fragment_B(sVt(_,_,Int<0>{}));
+        Tensor tSrQ = thread_mma_qk.partition_fragment_A(recast<ElementQMma>(sQ));
+        Tensor tSrK = thread_mma_qk.partition_fragment_B(recast<ElementKMma>(sK(_,_,Int<0>{})));
+        Tensor tOrV = thread_mma_pv.partition_fragment_B(recast<ElementKMma>(sVt(_,_,Int<0>{})));
         Tensor tOrP = make_tensor_like<Element>(LayoutP{});
         Tensor tSrSFQ = partition_fragment_SFA(sSFQ, thread_mma_qk);
         Tensor tSrSFK = partition_fragment_SFB(sSFK(_,_,_,Int<0>{}), thread_mma_qk);
