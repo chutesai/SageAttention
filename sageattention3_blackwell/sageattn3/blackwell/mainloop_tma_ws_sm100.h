@@ -303,6 +303,32 @@ struct CollectiveMainloopFwdSm100 {
     template <class T>
     struct has_sfb_layout<T, std::void_t<typename T::SFBLayout>> : std::true_type {};
 
+    template <bool HasLayout, class Traits>
+    struct sfa_layout;
+
+    template <class Traits>
+    struct sfa_layout<true, Traits> {
+      using type = typename Traits::SFALayout;
+    };
+
+    template <class Traits>
+    struct sfa_layout<false, Traits> {
+      using type = typename Traits::ALayout;
+    };
+
+    template <bool HasLayout, class Traits>
+    struct sfb_layout;
+
+    template <class Traits>
+    struct sfb_layout<true, Traits> {
+      using type = typename Traits::SFBLayout;
+    };
+
+    template <class Traits>
+    struct sfb_layout<false, Traits> {
+      using type = typename Traits::BLayout;
+    };
+
     template <class SFATensor, class Atom, class TiledThr, class TiledPerm>
     CUTE_HOST_DEVICE constexpr
     auto
@@ -311,13 +337,9 @@ struct CollectiveMainloopFwdSm100 {
       CUTE_STATIC_ASSERT_V(rank(sfatensor) >= Int<2>{});
 
       using AtomShape_MNK  = typename Atom::Shape_MNK;
-      using AtomLayoutSFA_TV = decltype([]() {
-        if constexpr (has_sfa_layout<typename Atom::Traits>::value) {
-          return typename Atom::Traits::SFALayout{};
-        } else {
-          return typename Atom::Traits::ALayout{};
-        }
-      }());
+      using AtomLayoutSFA_TV =
+        typename sfa_layout<has_sfa_layout<typename Atom::Traits>::value,
+                            typename Atom::Traits>::type;
   
       auto permutation_mnk = TiledPerm{};
       auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
@@ -352,13 +374,9 @@ struct CollectiveMainloopFwdSm100 {
       CUTE_STATIC_ASSERT_V(rank(sfbtensor) >= Int<2>{});
 
       using AtomShape_MNK  = typename Atom::Shape_MNK;
-      using AtomLayoutSFB_TV = decltype([]() {
-        if constexpr (has_sfb_layout<typename Atom::Traits>::value) {
-          return typename Atom::Traits::SFBLayout{};
-        } else {
-          return typename Atom::Traits::BLayout{};
-        }
-      }());
+      using AtomLayoutSFB_TV =
+        typename sfb_layout<has_sfb_layout<typename Atom::Traits>::value,
+                            typename Atom::Traits>::type;
   
       auto permutation_mnk = TiledPerm{};
       auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
