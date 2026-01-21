@@ -664,17 +664,26 @@ struct CollectiveMainloopFwdSm100 {
         Tensor tOrSFP_flt = filter_zeros(tOrSFP);
         Tensor tSrDS = make_tensor<float>(make_shape(_8{}, _4{}), make_stride(_1{}, _8{}));
         // copy qk and sf from smem to rmem
-        auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma_qk);
+        auto smem_tiled_copy_Q = make_tiled_copy_impl(
+            SmemCopyAtomQ{},
+            typename SmemCopyAtomQ::ValLayoutDst{},
+            make_shape(tile_size<0>(tiled_mma_qk), tile_size<2>(tiled_mma_qk)));
         auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(thread_idx);
         Tensor tSsQ = smem_thr_copy_Q.partition_S(as_position_independent_swizzle_tensor(sQ));
         Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
 
-        auto smem_tiled_copy_K = make_tiled_copy_B(SmemCopyAtomKV{}, tiled_mma_qk);
+        auto smem_tiled_copy_K = make_tiled_copy_impl(
+            SmemCopyAtomKV{},
+            typename SmemCopyAtomKV::ValLayoutDst{},
+            make_shape(tile_size<1>(tiled_mma_qk), tile_size<2>(tiled_mma_qk)));
         auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(thread_idx);
         Tensor tSsK = smem_thr_copy_K.partition_S(as_position_independent_swizzle_tensor(sK));
         Tensor tSrK_copy_view = smem_thr_copy_K.retile_D(tSrK);
 
-        auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomKV{}, tiled_mma_pv);
+        auto smem_tiled_copy_V = make_tiled_copy_impl(
+            SmemCopyAtomKV{},
+            typename SmemCopyAtomKV::ValLayoutDst{},
+            make_shape(tile_size<1>(tiled_mma_pv), tile_size<2>(tiled_mma_pv)));
         auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(thread_idx);
         Tensor tOsV = smem_thr_copy_V.partition_S(as_position_independent_swizzle_tensor(sVt));
         Tensor tOrV_copy_view = smem_thr_copy_V.retile_D(tOrV);
