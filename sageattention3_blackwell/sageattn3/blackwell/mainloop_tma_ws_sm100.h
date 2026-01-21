@@ -482,8 +482,8 @@ struct CollectiveMainloopFwdSm100 {
                     }();
         int l = bidh + bidb * get<2>(mainloop_params.shape_Q);
         Tensor gSFQ = local_tile(mSFQ(_, _, l), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
-        Tensor gSFK = local_tile(mSFK(_, _, l), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
-        Tensor gSFV = local_tile(mSFV(_, _, l), make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})), make_coord(_0{}, _));
+        Tensor gSFK = local_tile(mSFK, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, l));
+        Tensor gSFV = local_tile(mSFV, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})), make_coord(_0{}, _, l));
         auto block_tma_q = mainloop_params.tma_load_Q.get_slice(_0{});
         Tensor tQgQ = block_tma_q.partition_S(gQ);
         Tensor tQsQ = block_tma_q.partition_D(sQ);

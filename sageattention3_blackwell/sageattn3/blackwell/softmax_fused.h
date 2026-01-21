@@ -89,7 +89,10 @@ struct SoftmaxFused{
         }
         else {
             Tensor scores_max_prev = make_fragment_like(row_max);
-            cute::copy(row_max, scores_max_prev);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(row_max); ++i) {
+                scores_max_prev(i) = row_max(i);
+            }
             CUTLASS_PRAGMA_UNROLL
             for (int mi = 0; mi < size<0>(acc_reduction_view); mi++) {
                 CUTLASS_PRAGMA_UNROLL
