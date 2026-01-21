@@ -456,6 +456,8 @@ struct CollectiveMainloopFwdSm100 {
         Tensor sSFQ = make_tensor(make_smem_ptr(shared_storage.smem_SFQ.begin()), SmemLayoutSFQ{});
         Tensor sSFK = make_tensor(make_smem_ptr(shared_storage.smem_SFK.begin()), SmemLayoutSFK{});
         Tensor sSFV = make_tensor(make_smem_ptr(shared_storage.smem_SFV.begin()), SmemLayoutSFV{});
+        Tensor sSFK_tma = make_tensor(make_smem_ptr(shared_storage.smem_SFK.begin()), filter_zeros(SmemLayoutSFK{}));
+        Tensor sSFV_tma = make_tensor(make_smem_ptr(shared_storage.smem_SFV.begin()), filter_zeros(SmemLayoutSFV{}));
         Tensor sDS = make_tensor(make_smem_ptr(shared_storage.smem_ds.begin()), SmemLayoutDS{});
 
         Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.shape_Q);
@@ -492,18 +494,14 @@ struct CollectiveMainloopFwdSm100 {
         Tensor tKgK = group_modes<0, 3>(block_tma_k.partition_S(gK));
         Tensor tKsK = group_modes<0, 3>(block_tma_k.partition_D(sK));
         auto block_tma_sfk = mainloop_params.tma_load_SFK.get_slice(cluster_local_block_id.x);
-        auto [tKgSFK, tKsSFK] = tma_partition(
-            block_tma_sfk,
-            group_modes<0, 3>(sSFK),
-            group_modes<0, 3>(gSFK));
+        Tensor tKgSFK = block_tma_sfk.partition_S(gSFK);
+        Tensor tKsSFK = block_tma_sfk.partition_D(sSFK_tma);
         auto block_tma_v = mainloop_params.tma_load_V.get_slice(cluster_local_block_id.x);
         Tensor tVgV = group_modes<0, 3>(block_tma_v.partition_S(gV));
         Tensor tVsV = group_modes<0, 3>(block_tma_v.partition_D(sV));
         auto block_tma_sfv = mainloop_params.tma_load_SFV.get_slice(cluster_local_block_id.x);
-        auto [tVgSFV, tVsSFV] = tma_partition(
-            block_tma_sfv,
-            group_modes<0, 3>(sSFV),
-            group_modes<0, 3>(gSFV));
+        Tensor tVgSFV = block_tma_sfv.partition_S(gSFV);
+        Tensor tVsSFV = block_tma_sfv.partition_D(sSFV_tma);
         auto block_tma_ds = mainloop_params.tma_load_DS.get_slice(cluster_local_block_id.x);
         Tensor tDSgDS = group_modes<0, 3>(block_tma_ds.partition_S(gDS));
         Tensor tDSsDS = group_modes<0, 3>(block_tma_ds.partition_D(sDS));
