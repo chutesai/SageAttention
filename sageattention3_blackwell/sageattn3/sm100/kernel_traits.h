@@ -15,10 +15,13 @@
  *
  * SM100 (B200/B300) kernel traits for FlashAttention with FP4 blockscaled MMA.
  *
- * This follows the SM120 pattern but uses SM100-specific:
- *   - SMEM layout selectors (sm100_smem_selector)
- *   - MMA atoms that use tcgen05.mma with TMEM accumulators
- *   - SM100 blockscaled collective infrastructure
+ * KEY DIFFERENCES FROM SM120:
+ *   - Uses SM100_MMA_MXF4_SS atom (not SM120_16x32x64_TN_VS_NVFP4)
+ *   - Accumulators live in TMEM (256KB per SM), not registers
+ *   - Scale factors also stored in TMEM
+ *   - Uses tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale instruction
+ *   - M dimension MUST be 128 (hardware constraint)
+ *   - K dimension is 64 (256 bits / 4 bits per element)
  */
 
 #pragma once
@@ -33,6 +36,10 @@
 
 #include "cutlass/gemm/collective/collective_builder.hpp"
 
+// Include SM100 MMA atoms and TMEM support
+#include "cute/arch/mma_sm100_umma.hpp"
+#include "cute/atom/mma_traits_sm100.hpp"
+
 #include "../blackwell/blockscaled_layout.h"
 #include "../blackwell/named_barrier.h"
 
@@ -41,7 +48,30 @@ namespace flash {
 using namespace cute;
 
 ///////////////////////////////////////////////////////////////////////////////
+// TMEM Allocation for SM100 Flash Attention
+//
+// SM100 has 256KB TMEM per SM. We need to allocate space for:
+//   - S (QK^T scores): 128 x 128 x sizeof(float) = 64KB
+//   - O (output accumulator): 128 x headdim x sizeof(float)
+//   - P (softmax probabilities, FP4): 128 x 128 / 2 = 8KB
+//   - Scale factors for P: 128 x (128/16) = 1KB
+///////////////////////////////////////////////////////////////////////////////
+
+enum class Sm100TmemAlloc : uint32_t {
+    // For 128x128 tiles with headdim=128
+    kSizeS = 128 * 128,     // 16K floats = 64KB (S = Q*K^T)
+    kSizeO = 128 * 128,     // 16K floats = 64KB (O accumulator)
+    kSizeSF = 128 * 8,      // Scale factors (128 rows, headdim/16 columns)
+
+    S_offset = 0,
+    O_offset = S_offset + kSizeS,
+    SF_offset = O_offset + kSizeO,
+    kEnd = SF_offset + kSizeSF
+};
+
+///////////////////////////////////////////////////////////////////////////////
 // Shared Storage for SM100
+// Same structure as SM120 but pipelines use different types for TMEM
 ///////////////////////////////////////////////////////////////////////////////
 
 template <
@@ -71,6 +101,7 @@ struct SharedStorageSm100 : cute::aligned_struct<128, _0> {
     alignas(1024) cute::ArrayEngine<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
 
     struct {
+        // SM100 uses PipelineTmaUmmaAsync for TMEM-based MMA
         alignas(16) typename cutlass::PipelineTmaAsync<1>::SharedStorage pipeline_q;
         alignas(16) typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_k;
         alignas(16) typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_v;
@@ -82,10 +113,7 @@ struct SharedStorageSm100 : cute::aligned_struct<128, _0> {
 ///////////////////////////////////////////////////////////////////////////////
 // SM100 Flash Forward Kernel Traits
 //
-// KEY DIFFERENCES FROM SM120:
-//   - Uses sm100_smem_selector instead of sm120_rr_smem_selector
-//   - Uses OpClassBlockScaledTensorOp with SM100 collective builder
-//   - MMA atoms produce output in TMEM instead of registers
+// Uses SM100_MMA_MXF4_SS atoms with TMEM accumulators
 ///////////////////////////////////////////////////////////////////////////////
 
 template <
@@ -100,33 +128,36 @@ template <
 >
 struct Flash_fwd_kernel_traits_sm100 {
 
-    // Basic configuration - same as SM120
-    static constexpr int kBlockM = kBlockM_;
+    // Basic configuration
+    // SM100 MXF4 MMA requires M=128
+    static constexpr int kBlockM = 128;  // MUST be 128 for SM100_MMA_MXF4_SS
     static constexpr int kBlockN = kBlockN_;
     static constexpr int kHeadDim = kHeadDim_;
     static constexpr bool BlockMean = BlockMean_;
     static constexpr bool SmoothQ = true;
 
+    static_assert(kBlockM_ == 128, "SM100 FP4 MMA requires M=128");
     static_assert(kHeadDim % 32 == 0);
-    static_assert(kBlockM == 64 || kBlockM == 128);
 
     // Thread/warp configuration
-    static constexpr int kNWarps = kBlockM == 128 ? 12 : 8;
+    // SM100 uses different warp counts for TMEM management
+    static constexpr int kNWarps = 12;  // SM100 typically uses 12 warps
     static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
     static constexpr int kClusterM = kClusterM_;
     static constexpr int kStages = kStages_;
     static constexpr int EpiStages = 1;
 
     // Scale factor configuration
-    static constexpr int NumSFQK = kHeadDim / 16;
-    static constexpr int NumSFPV = kBlockN / 16;
+    // SM100 uses vector size 16 for NV FP4 scale factors
     static constexpr int SFVectorSize = 16;
     static constexpr int kSFVecSize = SFVectorSize;
+    static constexpr int NumSFQK = kHeadDim / SFVectorSize;
+    static constexpr int NumSFPV = kBlockN / SFVectorSize;
 
-    // Element types - same interface as SM120
-    using ElementSF = cutlass::float_ue4m3_t;
-    using Element = cutlass::float_e2m1_t;
-    using ElementAccum = float;
+    // Element types
+    using ElementSF = cutlass::float_ue4m3_t;   // FP8 E4M3 scale factors (NV format)
+    using Element = cutlass::float_e2m1_t;       // FP4 E2M1 data
+    using ElementAccum = float;                   // FP32 accumulators (in TMEM!)
     using ElementOut = ElementOut_;
     using index_t = int64_t;
 
@@ -138,38 +169,49 @@ struct Flash_fwd_kernel_traits_sm100 {
     using ArchTag = cutlass::arch::Sm100;
 
     ///////////////////////////////////////////////////////////////////////////
-    // MMA Configuration
-    // For SM100, we use the same blockscaled MMA pattern as SM120 but with
-    // SM100-specific atoms that use tcgen05.mma instructions
+    // MMA Configuration for SM100
+    //
+    // SM100_MMA_MXF4_SS: M=128, N=8-256, K=64, VS=16
+    // Uses tcgen05.mma with TMEM accumulators
     ///////////////////////////////////////////////////////////////////////////
 
-    using PermTileM = decltype(cute::min(size<0>(TileShape_MNK{}), _128{}));
-    using PermTileN = _32;
+    using PermTileM = Int<128>;  // Must be 128 for SM100
+    using PermTileN = _32;       // Match SM120 pattern
     using PermTileK = Int<kHeadDim>;
 
-    using ElementQMma = decltype(cutlass::gemm::collective::detail::sm1xx_kernel_input_element_to_mma_input_element<Element>());
-    using ElementKMma = decltype(cutlass::gemm::collective::detail::sm1xx_kernel_input_element_to_mma_input_element<Element>());
+    // Element types for MMA (same as input, CUTLASS handles conversion)
+    using ElementQMma = Element;
+    using ElementKMma = Element;
 
-    using AtomLayoutMNK = std::conditional_t<kBlockM == 128,
-                                            Layout<Shape<_8, _1, _1>>,
-                                            Layout<Shape<_4, _1, _1>>
-                                            >;
+    // SM100 MMA atom: 128 x N x 64 with VS=16 scale factors
+    // For QK: M=128, N=kBlockN (128), K=kHeadDim (64 or 128)
+    // For PV: M=128, N=kHeadDim (64 or 128), K=kBlockN (128)
 
-    // For SM100, use the SM120 blockscaled MMA atom pattern
-    // The SM100 will use its tcgen05.mma internally when compiled for sm_100a
-    using TiledMmaQK = decltype(cute::make_tiled_mma(
-        cute::SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4{},
-        AtomLayoutMNK{},
-        Tile<PermTileM, PermTileN, PermTileK>{}
-    ));
+    // Create tiled MMA using SM100_MMA_MXF4_SS
+    // Note: SM100_MMA_MXF4_SS has fixed M=128, so we need to tile appropriately
+    using MmaAtomQK = cute::SM100_MMA_MXF4_SS<
+        Element, Element, ElementAccum, ElementSF,
+        128,           // M = 128 (required)
+        kBlockN,       // N = tile N dimension
+        SFVectorSize,  // VS = 16 for NV FP4
+        UMMA::Major::K,  // A major (row major Q)
+        UMMA::Major::K   // B major (col major K^T)
+    >;
 
-    using TiledMmaPV = decltype(cute::make_tiled_mma(
-        cute::SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4{},
-        AtomLayoutMNK{},
-        Tile<PermTileM, _32, PermTileK>{}
-    ));
+    using MmaAtomPV = cute::SM100_MMA_MXF4_SS<
+        Element, Element, ElementAccum, ElementSF,
+        128,           // M = 128 (required)
+        kHeadDim,      // N = head dimension
+        SFVectorSize,  // VS = 16
+        UMMA::Major::K,  // A major
+        UMMA::Major::K   // B major
+    >;
 
-    static constexpr int MMA_NSF = size<2>(typename TiledMmaQK::AtomShape_MNK{}) / SFVectorSize;
+    // Create tiled MMA from atoms
+    using TiledMmaQK = decltype(cute::make_tiled_mma(MmaAtomQK{}));
+    using TiledMmaPV = decltype(cute::make_tiled_mma(MmaAtomPV{}));
+
+    static constexpr int MMA_NSF = 64 / SFVectorSize;  // K=64 / VS=16 = 4
 
     ///////////////////////////////////////////////////////////////////////////
     // Copy Atoms
@@ -180,13 +222,18 @@ struct Flash_fwd_kernel_traits_sm100 {
 
     ///////////////////////////////////////////////////////////////////////////
     // SMEM Layouts
-    // Use SM100-specific SMEM selectors where available, fall back to SM120
+    // Use SM100 SMEM selectors for optimal memory access patterns
     ///////////////////////////////////////////////////////////////////////////
 
-    using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::sm120_rr_smem_selector<Element, decltype(size<2>(TileShape_MNK{}))>());
-    using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::sm120_rr_smem_selector<Element, decltype(size<2>(TileShape_MNK{}))>());
-    using SmemLayoutAtomV = decltype(cutlass::gemm::collective::detail::sm120_rr_smem_selector<Element, decltype(size<2>(TileShape_MNK{}))>());
-    using SmemLayoutAtomVt = decltype(cutlass::gemm::collective::detail::sm120_rr_smem_selector<Element, decltype(size<1>(TileShape_MNK{}))>());
+    // Use SM100 smem selector (falls back to SM90 patterns which work for SM100)
+    using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::sm90_smem_selector<
+        GMMA::Major::K, Element, Int<kBlockM>, Int<kHeadDim>>());
+    using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::sm90_smem_selector<
+        GMMA::Major::K, Element, Int<kBlockN>, Int<kHeadDim>>());
+    using SmemLayoutAtomV = decltype(cutlass::gemm::collective::detail::sm90_smem_selector<
+        GMMA::Major::K, Element, Int<kBlockN>, Int<kHeadDim>>());
+    using SmemLayoutAtomVt = decltype(cutlass::gemm::collective::detail::sm90_smem_selector<
+        GMMA::Major::K, Element, Int<kHeadDim>, Int<kBlockN>>());
 
     using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQ{}, select<0, 2>(TileShape_MNK{})));
     using SmemLayoutK = decltype(tile_to_shape(SmemLayoutAtomK{},
@@ -207,7 +254,7 @@ struct Flash_fwd_kernel_traits_sm100 {
     using SmemCopyAtomDS = Copy_Atom<UniversalCopy<float>, float>;
 
     ///////////////////////////////////////////////////////////////////////////
-    // Scale Factor Layouts - same as SM120
+    // Scale Factor Layouts
     ///////////////////////////////////////////////////////////////////////////
 
     using BlkScaledConfig = flash::BlockScaledConfig<SFVectorSize>;
@@ -267,6 +314,7 @@ struct Flash_fwd_kernel_traits_sm100 {
 
     ///////////////////////////////////////////////////////////////////////////
     // Pipeline Types
+    // SM100 uses different pipeline types for TMEM-based MMA
     ///////////////////////////////////////////////////////////////////////////
 
     using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;

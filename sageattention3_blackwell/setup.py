@@ -81,8 +81,9 @@ if not SKIP_CUDA_BUILD:
     cutlass_dir = repo_dir / "csrc" / "cutlass"
     (repo_dir / "csrc").mkdir(parents=True, exist_ok=True)
     if not cutlass_dir.exists():
-        # Clone CUTLASS v3.8.0 which has proper SM100 support
-        # Note: Newer versions may have broken namespace declarations in SM100 code
+        # Clone CUTLASS v4.3.5 which has proper SM100 support with fixed namespaces
+        # NOTE: v3.8.0 has broken namespace declarations (e.g., "namespace 1::TMEM::UTCCP")
+        # If you have an old CUTLASS clone, delete csrc/cutlass and rebuild
         subprocess.run(
             ["git", "clone", "--depth", "1", "--branch", "v4.3.5",
              "https://github.com/NVIDIA/cutlass.git", str(cutlass_dir)],
