@@ -111,14 +111,14 @@ struct CollectiveMainloopFwdSm100 {
     using TMA_SFKV = decltype(make_tma_copy<uint16_t>(
         GmemTiledCopySF{},
         make_tensor(static_cast<ElementSF const*>(nullptr), LayoutSF{}),
-        SmemLayoutSFK{}(_,_,_,_,_,cute::Int<0>{}),
+        SmemLayoutSFK{}(_,_,_,_,cute::Int<0>{}),
         make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
         _1{}));
 
     using TMA_SFV = decltype(make_tma_copy<uint16_t>(
         GmemTiledCopySF{},
         make_tensor(static_cast<ElementSF const*>(nullptr), LayoutSF{}),
-        SmemLayoutSFV{}(_,_,_,_,_,cute::Int<0>{}),
+        SmemLayoutSFV{}(_,_,_,_,cute::Int<0>{}),
         make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
         _1{}));
 
@@ -240,7 +240,7 @@ struct CollectiveMainloopFwdSm100 {
         TMA_SFKV tma_load_sfk = make_tma_copy<uint16_t>(
             GmemTiledCopySF{},
             mSFK,
-            SmemLayoutSFK{}(_, _, _, _, _, _0{}),
+            SmemLayoutSFK{}(_, _, _, _, _0{}),
             make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
             _1{});
         LayoutSF layout_sfv = BlkScaledConfig::tile_atom_to_shape_SFB(args.shape_SFV);
@@ -248,7 +248,7 @@ struct CollectiveMainloopFwdSm100 {
         TMA_SFV tma_load_sfv = make_tma_copy<uint16_t>(
             GmemTiledCopySF{},
             mSFV,
-            SmemLayoutSFV{}(_, _, _, _, _, _0{}),
+            SmemLayoutSFV{}(_, _, _, _, _0{}),
             make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{})),
             _1{});
         return {args.shape_Q, layout_sfq,
@@ -612,8 +612,8 @@ struct CollectiveMainloopFwdSm100 {
         Tensor tOrV = thread_mma_pv.partition_fragment_B(sV(_,_,Int<0>{}));
         Tensor tOrP = make_tensor_like<Element>(LayoutP{});
         Tensor tSrSFQ = partition_fragment_SFA(sSFQ, thread_mma_qk);
-        Tensor tSrSFK = partition_fragment_SFB(sSFK(_,_,Int<0>{}), thread_mma_qk);
-        Tensor tOrSFV = partition_fragment_SFB(sSFV(_,_,Int<0>{}), thread_mma_pv);
+        Tensor tSrSFK = partition_fragment_SFB(sSFK(_,_,_,_,Int<0>{}), thread_mma_qk);
+        Tensor tOrSFV = partition_fragment_SFB(sSFV(_,_,_,_,Int<0>{}), thread_mma_pv);
         Tensor tOrSFP = make_tensor<ElementSF>(LayoutSFP{});
         Tensor tOrSFP_flt = filter_zeros(tOrSFP);
         Tensor tSrDS = make_tensor<float>(make_shape(_8{}, _4{}), make_stride(_1{}, _8{}));
