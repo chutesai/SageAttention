@@ -352,9 +352,9 @@ __global__ void scaled_fp4_quant_sm100_kernel(
 
   if (token_id < num_tokens) {
     using Sm100Config = cutlass::detail::Sm1xxBlockScaledConfig<16>;
-    auto layout_sfa = Sm100Config::tile_atom_to_shape_SFA(cute::make_shape(num_tokens, head_dim, batch_size * num_heads));
+    auto layout_sfa = Sm100Config::tile_atom_to_shape_SFA(cute::make_shape(num_tokens, head_dim / 16, batch_size * num_heads));
     int l = batch_id * num_heads + head_id;
-    int k_coord = int(threadIdx.x % NUM_THREADS_PER_TOKEN) * 16;
+    int k_coord = int(threadIdx.x % NUM_THREADS_PER_TOKEN);
     int64_t offset = layout_sfa(cute::make_coord(token_id, k_coord, l));
     output_sf[offset] = SFValueFP8;
   }
@@ -647,9 +647,9 @@ __global__ void scaled_fp4_dequant_sm100_kernel(
   const int d1 = d0 + 1;
 
   using Sm100Config = cutlass::detail::Sm1xxBlockScaledConfig<16>;
-  auto layout_sfa = Sm100Config::tile_atom_to_shape_SFA(cute::make_shape(num_tokens, head_dim, batch_size * num_heads));
+  auto layout_sfa = Sm100Config::tile_atom_to_shape_SFA(cute::make_shape(num_tokens, head_dim / 16, batch_size * num_heads));
   int l = batch_id * num_heads + head_id;
-  int k_coord = (d0 / 16) * 16;
+  int k_coord = d0 / 16;
   int64_t sf_offset = layout_sfa(cute::make_coord(token_id, k_coord, l));
   uint8_t scale_byte = input_sf[sf_offset];
   float scale = float(reinterpret_cast<__nv_fp8_e4m3&>(scale_byte));

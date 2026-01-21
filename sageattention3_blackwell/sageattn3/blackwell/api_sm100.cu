@@ -50,8 +50,8 @@ __device__ __forceinline__ float load_fp4_scaled(const uint8_t* packed, const ui
     uint8_t nibble = (d & 1) ? (byte >> 4) : (byte & 0xF);
     float val = fp4_to_float(nibble);
     using Sm100Config = cutlass::detail::Sm1xxBlockScaledConfig<16>;
-    auto layout_sfa = Sm100Config::tile_atom_to_shape_SFA(cute::make_shape(seqlen, head_dim, total_l));
-    int k_coord = (d >> 4) * 16;
+    auto layout_sfa = Sm100Config::tile_atom_to_shape_SFA(cute::make_shape(seqlen, head_dim / 16, total_l));
+    int k_coord = d >> 4;
     int64_t offset = layout_sfa(cute::make_coord(token, k_coord, l));
     float scale = fp8_to_float(sf[offset]);
     return val * scale;
