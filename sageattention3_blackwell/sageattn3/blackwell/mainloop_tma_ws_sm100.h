@@ -311,10 +311,13 @@ struct CollectiveMainloopFwdSm100 {
       CUTE_STATIC_ASSERT_V(rank(sfatensor) >= Int<2>{});
 
       using AtomShape_MNK  = typename Atom::Shape_MNK;
-      using AtomLayoutSFA_TV = std::conditional_t<
-          has_sfa_layout<typename Atom::Traits>::value,
-          typename Atom::Traits::SFALayout,
-          typename Atom::Traits::ALayout>;
+      using AtomLayoutSFA_TV = decltype([]() {
+        if constexpr (has_sfa_layout<typename Atom::Traits>::value) {
+          return typename Atom::Traits::SFALayout{};
+        } else {
+          return typename Atom::Traits::ALayout{};
+        }
+      }());
   
       auto permutation_mnk = TiledPerm{};
       auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
@@ -349,10 +352,13 @@ struct CollectiveMainloopFwdSm100 {
       CUTE_STATIC_ASSERT_V(rank(sfbtensor) >= Int<2>{});
 
       using AtomShape_MNK  = typename Atom::Shape_MNK;
-      using AtomLayoutSFB_TV = std::conditional_t<
-          has_sfb_layout<typename Atom::Traits>::value,
-          typename Atom::Traits::SFBLayout,
-          typename Atom::Traits::BLayout>;
+      using AtomLayoutSFB_TV = decltype([]() {
+        if constexpr (has_sfb_layout<typename Atom::Traits>::value) {
+          return typename Atom::Traits::SFBLayout{};
+        } else {
+          return typename Atom::Traits::BLayout{};
+        }
+      }());
   
       auto permutation_mnk = TiledPerm{};
       auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
