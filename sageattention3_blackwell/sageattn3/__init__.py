@@ -13,4 +13,4 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-from .api import sageattn3_blackwell, get_gpu_arch, is_sm100, is_sm120
+from .api import sageattn3_blackwell, sageattn3_sm100_fast, get_gpu_arch, is_sm100, is_sm120

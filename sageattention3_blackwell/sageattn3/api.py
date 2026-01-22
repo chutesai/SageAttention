@@ -306,6 +306,24 @@ def blockscaled_fp4_attn(qlist: Tuple,
 
 
 def sageattn3_blackwell(q, k, v, attn_mask = None, is_causal = False, per_block_mean = True, **kwargs):
+    """SageAttention3 for Blackwell GPUs.
+
+    For SM100 (B200/B300), uses the high-performance CUTLASS FMHA by default.
+    For SM120 (RTX 5090), uses the FP4 blockscaled attention.
+
+    Args:
+        q: Query tensor [batch, heads, seqlen_q, head_dim]
+        k: Key tensor [batch, heads, seqlen_k, head_dim]
+        v: Value tensor [batch, heads, seqlen_k, head_dim]
+        attn_mask: Optional attention mask (not used in SM100 path)
+        is_causal: Whether to use causal masking
+        per_block_mean: Whether to use per-block mean subtraction (FP4 path only)
+    """
+    # Use high-performance CUTLASS FMHA for SM100 by default
+    if is_sm100():
+        return sageattn3_sm100_fast(q, k, v, is_causal=is_causal)
+
+    # Fall back to FP4 path for SM120 or if explicitly requested
     if q.size(-1) >= 256:
         print(f"Unsupported Headdim {q.size(-1)}")
         return sdpa(q, k, v, is_causal = is_causal)
@@ -318,7 +336,7 @@ def sageattn3_blackwell(q, k, v, attn_mask = None, is_causal = False, per_block_
     vlist_from_cuda = scale_and_quant_fp4_transpose(v)
     o_fp4 = blockscaled_fp4_attn(
     qlist_from_cuda,
-    klist_from_cuda, 
+    klist_from_cuda,
     vlist_from_cuda,
     delta_s,
     KL,
@@ -327,3 +345,45 @@ def sageattn3_blackwell(q, k, v, attn_mask = None, is_causal = False, per_block_
     is_bf16
     )[0][:, :, :QL, :].contiguous()
     return o_fp4
+
+
+def sageattn3_sm100_fast(q, k, v, is_causal=False, scale=None):
+    """High-performance FMHA for SM100 (B200/B300) using CUTLASS example 77.
+
+    This is the fastest attention implementation for B200/B300, using NVIDIA's
+    official warp-specialized FMHA kernels with TMEM accumulators.
+
+    Args:
+        q: Query tensor [batch, heads, seqlen_q, head_dim] in BF16
+        k: Key tensor [batch, heads, seqlen_k, head_dim] in BF16
+        v: Value tensor [batch, heads, seqlen_k, head_dim] in BF16
+        is_causal: Whether to use causal masking
+        scale: Softmax scale (default: 1/sqrt(head_dim))
+
+    Returns:
+        Output tensor [batch, heads, seqlen_q, head_dim] in BF16
+    """
+    try:
+        import fmha_sm100
+    except ImportError:
+        raise RuntimeError(
+            "SM100 FMHA (fmha_sm100) not found. "
+            "Please rebuild with a B200/B300 GPU."
+        )
+
+    # Ensure contiguous BF16 tensors
+    if q.dtype != torch.bfloat16:
+        q = q.to(torch.bfloat16)
+    if k.dtype != torch.bfloat16:
+        k = k.to(torch.bfloat16)
+    if v.dtype != torch.bfloat16:
+        v = v.to(torch.bfloat16)
+
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+
+    if scale is None:
+        return fmha_sm100.fwd_auto_scale(q, k, v, is_causal)
+    else:
+        return fmha_sm100.fwd(q, k, v, is_causal, scale)
