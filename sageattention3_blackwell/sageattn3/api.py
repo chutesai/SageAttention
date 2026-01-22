@@ -119,12 +119,12 @@ def triton_group_mean(q: torch.Tensor):
     B, H, L, D = q.shape
     GROUP_SIZE = 128
     num_groups = L // GROUP_SIZE
-    
+
     q_out = torch.empty_like(q)  # [B, H, L, D]
-    qm = torch.empty(B, H, num_groups, D, device=q.device, dtype=q.dtype) 
-    
+    qm = torch.empty(B, H, num_groups, D, device=q.device, dtype=q.dtype)
+
     grid = (B, H, num_groups)
-    
+
     group_mean_kernel[grid](
         q, q_out, qm,
         B, H, L, D,
@@ -133,6 +133,94 @@ def triton_group_mean(q: torch.Tensor):
         GROUP_SIZE=GROUP_SIZE
     )
     return q_out, qm
+
+
+@triton.jit
+def matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """Simple matmul kernel: C = A @ B^T where A is (M, K) and B is (N, K)."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Initialize accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension
+    for k_start in range(0, K, BLOCK_K):
+        k_offs = k_start + offs_k
+
+        # Load A block: (BLOCK_M, BLOCK_K)
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + k_offs[None, :] * stride_ak
+        a_mask = (offs_m[:, None] < M) & (k_offs[None, :] < K)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+
+        # Load B block: (BLOCK_N, BLOCK_K) - B is (N, K), we want B^T
+        b_ptrs = b_ptr + offs_n[:, None] * stride_bk + k_offs[None, :] * stride_bn
+        b_mask = (offs_n[:, None] < N) & (k_offs[None, :] < K)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Compute: A @ B^T = A @ B.T, but B is loaded as (BLOCK_N, BLOCK_K)
+        # So we do A (BLOCK_M, BLOCK_K) @ B.T (BLOCK_K, BLOCK_N)
+        acc += tl.dot(a, tl.trans(b))
+
+    # Store result
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+
+
+def _matmul_no_cublas(qm: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """Compute qm @ k^T without using cuBLAS (which is broken on B200 with CUDA 13.0).
+
+    Args:
+        qm: (B, H, M, D) query means
+        k: (B, H, N, D) keys
+
+    Returns:
+        delta_s: (B, H, M, N) in float32
+    """
+    B, H, M, D = qm.shape
+    N = k.size(2)
+
+    # Reshape to 3D for simpler kernel: (B*H, M, D) and (B*H, N, D)
+    qm_3d = qm.reshape(B * H, M, D).contiguous()
+    k_3d = k.reshape(B * H, N, D).contiguous()
+
+    # Output: (B*H, M, N)
+    out = torch.empty(B * H, M, N, device=qm.device, dtype=torch.float32)
+
+    # Launch kernel for each batch*head
+    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64
+    grid = lambda meta: (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N), B * H)
+
+    # Process each batch*head separately
+    for bh in range(B * H):
+        qm_bh = qm_3d[bh]  # (M, D)
+        k_bh = k_3d[bh]    # (N, D)
+        out_bh = out[bh]   # (M, N)
+
+        grid_2d = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+        matmul_kernel[grid_2d](
+            qm_bh, k_bh, out_bh,
+            M, N, D,
+            qm_bh.stride(0), qm_bh.stride(1),
+            k_bh.stride(0), k_bh.stride(1),
+            out_bh.stride(0), out_bh.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        )
+
+    # Reshape back to 4D
+    return out.reshape(B, H, M, N).contiguous()
 
 
 def preprocess_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_mean: bool = True):
@@ -151,10 +239,9 @@ def preprocess_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_
     else:
         qm = q.mean(dim=-2, keepdim=True)
         q = q - qm
-    # Use float32 for matmul and ensure contiguous tensors to avoid cuBLAS issues on SM100
-    qm_f32 = qm.float().contiguous()
-    k_f32 = k.float().transpose(-2, -1).contiguous()
-    delta_s = torch.matmul(qm_f32, k_f32).contiguous()
+    # Compute delta_s = qm @ k^T without using cuBLAS (broken on B200 with CUDA 13.0)
+    # Use a triton kernel or manual computation instead
+    delta_s = _matmul_no_cublas(qm, k)
     return q, k, v, delta_s
 
 def scale_and_quant_fp4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
