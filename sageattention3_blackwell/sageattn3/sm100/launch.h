@@ -162,11 +162,12 @@ void run_mha_fwd_sm100_(Flash_fwd_params& params, cudaStream_t stream) {
             // SM100 with FP4:
             //   - kBlockM=256 because TileShapeQK = TileShape / ThreadShape<2,1,1>, giving M=128
             //   - HeadDim >= 128 required by FP4 TMA load constraint (TileShape_K % 128 == 0)
+            //   - kStages=2 to fit in B200's 227KB max shared memory per block
             if constexpr (Headdim == 128) {
-                using Ktraits = Flash_fwd_kernel_traits_sm100<128, 256, 128, 3, 1, per_block, T, O>;
+                using Ktraits = Flash_fwd_kernel_traits_sm100<128, 256, 128, 2, 1, per_block, T, O>;
                 run_flash_fwd_sm100<Ktraits, Is_causal>(params, stream);
             } else if constexpr (Headdim == 256) {
-                using Ktraits = Flash_fwd_kernel_traits_sm100<256, 256, 128, 3, 1, per_block, T, O>;
+                using Ktraits = Flash_fwd_kernel_traits_sm100<256, 256, 128, 2, 1, per_block, T, O>;
                 run_flash_fwd_sm100<Ktraits, Is_causal>(params, stream);
             } else {
                 // HeadDim=64 not supported on SM100 with FP4 due to TMA load constraint
