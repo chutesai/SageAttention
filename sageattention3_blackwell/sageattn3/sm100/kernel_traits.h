@@ -15,12 +15,8 @@
  *
  * SM100 (B200/B300) kernel traits for SageAttention3 with FP4 blockscaled MMA.
  *
- * KEY DIFFERENCES FROM SM120:
- *   - Accumulators live in TMEM (256KB per SM), not registers
- *   - Warp-specialized execution: 16 warps with specific roles
- *   - Uses UMMA atoms instead of GMMA
- *   - M dimension MUST be 128 (hardware constraint for UMMA)
- *   - Manually constructed MMA and SMEM layouts (similar to SM120)
+ * This file uses CUTLASS CollectiveBuilder to automatically generate correct
+ * TMA descriptors, SMEM layouts, and MMA configurations for SM100.
  */
 
 #pragma once
@@ -41,7 +37,7 @@
 #include "cutlass/gemm/collective/builders/sm100_common.inl"
 #include "cute/arch/tmem_allocator_sm100.hpp"
 #include "cute/arch/mma_sm100_umma.hpp"
-#include "cute/atom/mma_traits_sm100.hpp"  // For UMMA::Layout_K_SW128_Atom
+#include "cute/atom/mma_traits_sm100.hpp"
 
 #include "../blackwell/blockscaled_layout.h"
 #include "../blackwell/named_barrier.h"
@@ -52,15 +48,6 @@ using namespace cute;
 
 ///////////////////////////////////////////////////////////////////////////////
 // SM100 Warp Roles
-//
-// SM100 uses warp-specialized execution with 16 warps total:
-//   - Warps 0-3:   Softmax0 (compute softmax on S0)
-//   - Warps 4-7:   Softmax1 (compute softmax on S1)
-//   - Warps 8-11:  Correction (rescale O accumulators)
-//   - Warp 12:     MMA (tensor core computations)
-//   - Warp 13:     Load (TMA loads Q, K, V)
-//   - Warp 14:     Epilogue (TMA store O)
-//   - Warp 15:     Empty (donates registers)
 ///////////////////////////////////////////////////////////////////////////////
 
 struct Sm100WarpSpecializedSchedule {
@@ -92,7 +79,6 @@ struct Sm100WarpSpecializedSchedule {
     static constexpr int kNumWarpsMMA = 1;
     static constexpr int kNumWarps = 16;
 
-    // Register allocation per warp role
     static constexpr int kNumRegsSoftmax = 192;
     static constexpr int kNumRegsCorrection = 96;
     static constexpr int kNumRegsOther = 32;
@@ -101,12 +87,6 @@ struct Sm100WarpSpecializedSchedule {
 
 ///////////////////////////////////////////////////////////////////////////////
 // TMEM Allocation for SM100
-//
-// SM100 has 256KB TMEM per SM. For flash attention we allocate:
-//   - S0, S1: Score matrices (128 columns each, overlaps with V0/V1 and P0/P1)
-//   - O0, O1: Output accumulators (128 columns each)
-//   - V0, V1: Stats storage (row max/sum) - overlaps with S
-//   - P0, P1: Probabilities after softmax - overlaps with S
 ///////////////////////////////////////////////////////////////////////////////
 
 enum class Sm100TmemAlloc : uint32_t {
@@ -124,7 +104,6 @@ enum class Sm100TmemAlloc : uint32_t {
     kEnd = O1 + kSizeO
 };
 
-// Indices for V0/V1 (stats storage)
 enum {
     kIdxOldRowMax = 0,
     kIdxNewRowMax = 1,
@@ -133,53 +112,9 @@ enum {
 };
 
 ///////////////////////////////////////////////////////////////////////////////
-// Shared Storage for SM100
-///////////////////////////////////////////////////////////////////////////////
-
-template <
-    typename Element,
-    typename ElementOut,
-    typename SmemLayoutQ,
-    typename SmemLayoutKV,
-    typename SmemLayoutO,
-    int StageCountQ,
-    int StageCountKV
->
-struct SharedStorageSm100 : cute::aligned_struct<128, _0> {
-    // Q tensor in SMEM
-    alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
-
-    // K and V share SMEM (loaded sequentially)
-    union {
-        alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutKV>> smem_k;
-        alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutKV>> smem_v;
-    };
-
-    // Output tensor in SMEM (for epilogue TMA store)
-    alignas(1024) cute::ArrayEngine<ElementOut, cute::cosize_v<SmemLayoutO>> smem_o;
-
-    // Pipeline synchronization
-    struct {
-        alignas(16) typename cutlass::PipelineTmaAsync<StageCountQ>::SharedStorage pipeline_q;
-        alignas(16) typename cutlass::PipelineTmaAsync<StageCountKV>::SharedStorage pipeline_kv;
-        alignas(16) typename cutlass::PipelineAsync<1>::SharedStorage pipeline_s0;
-        alignas(16) typename cutlass::PipelineAsync<1>::SharedStorage pipeline_s1;
-        alignas(16) typename cutlass::PipelineAsync<1>::SharedStorage pipeline_c0;
-        alignas(16) typename cutlass::PipelineAsync<1>::SharedStorage pipeline_c1;
-        alignas(16) typename cutlass::PipelineAsync<2>::SharedStorage pipeline_o;
-        alignas(16) typename cutlass::PipelineAsync<2>::SharedStorage pipeline_epi;
-        alignas(16) typename cutlass::OrderedSequenceBarrier<1, 2>::SharedStorage order_s01;
-    } pipelines;
-
-    // TMEM base pointer (set by MMA warp after allocation)
-    uint32_t tmem_base_ptr;
-};
-
-///////////////////////////////////////////////////////////////////////////////
 // SM100 Flash Forward Kernel Traits
 //
-// Uses manual MMA/SMEM construction similar to SM120
-// FP4 with E4M3 scale factors, SFVectorSize=16 (NVIDIA FP4 format)
+// Uses CUTLASS CollectiveBuilder for automatic configuration
 ///////////////////////////////////////////////////////////////////////////////
 
 template <
@@ -189,7 +124,7 @@ template <
     int kStages_,
     int kClusterM_,
     bool BlockMean_,
-    typename ElementPairType_ = cutlass::nv_float4_t<cutlass::float_e2m1_t>,
+    typename Element_ = cutlass::float_e2m1_t,      // FP4 E2M1 data
     typename ElementOut_ = cutlass::bfloat16_t
 >
 struct Flash_fwd_kernel_traits_sm100 {
@@ -201,11 +136,8 @@ struct Flash_fwd_kernel_traits_sm100 {
     static constexpr bool BlockMean = BlockMean_;
     static constexpr bool SmoothQ = true;
 
-    // SM100 UMMA requires M=128 (single tile)
-    // With ThreadShape = (2,1,1), we need kBlockM = 256 so TileShapeQK.M = 128
-    static_assert(kBlockM == 256, "SM100 requires kBlockM=256 (TileShapeQK.M=128 after ThreadShape division)");
-    // SM100 with FP4 requires HeadDim >= 128 (TMA load constraint for 4-bit data)
-    static_assert(kHeadDim >= 128, "SM100 with FP4 requires HeadDim >= 128 (TMA load constraint)");
+    static_assert(kBlockM == 256, "SM100 requires kBlockM=256");
+    static_assert(kHeadDim >= 128, "SM100 with FP4 requires HeadDim >= 128");
     static_assert(kHeadDim % 32 == 0);
 
     // Warp scheduling
@@ -215,228 +147,100 @@ struct Flash_fwd_kernel_traits_sm100 {
     static constexpr int kClusterM = kClusterM_;
 
     // Pipeline stages
-    static constexpr int kStageCountQ = 1;  // Q is loaded once
+    static constexpr int kStageCountQ = 2;
     static constexpr int kStageCountKV = kStages_;
 
-    // Scale factor configuration (NVIDIA FP4 format: SFVectorSize=16, E4M3 SF)
-    static constexpr int SFVectorSize = 16;
-    static constexpr int kSFVecSize = SFVectorSize;
-    static constexpr int NumSFQK = kHeadDim / SFVectorSize;
-    static constexpr int NumSFPV = kBlockN / SFVectorSize;
-
     // Element types
-    using ElementSF = cutlass::float_ue4m3_t;    // FP8 E4M3 unsigned scale factors
-    using Element = cutlass::float_e2m1_t;       // FP4 E2M1 data
-    using ElementAccum = float;                   // FP32 accumulators (in TMEM!)
+    using Element = Element_;
+    using ElementAccum = float;
     using ElementOut = ElementOut_;
     using index_t = int64_t;
 
     // Tile shapes
-    // For SM100 warp-specialized: tile processes 2 Q blocks alternating
     using TileShape_MNK = Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape_MNK = Shape<_1, _1, _1>;
-
-    // Thread shape: how Q tiles are distributed across softmax warps
-    // (2, 1, 1) means two Q blocks stacked - best for large Q
     using ThreadShape = Shape<_2, _1, _1>;
-
-    // TileShape for individual QK/PV computations (after ThreadShape division)
-    // TileShapeQK.M = 256/2 = 128, which matches UMMA's M requirement
     using TileShapeQK = decltype(shape_div(TileShape_MNK{}, ThreadShape{}));
     using TileShapePV = decltype(select<0,2,1>(TileShapeQK{}));
 
     // Architecture tag
     using ArchTag = cutlass::arch::Sm100;
 
-    // Permutation tile sizes (same as SM120)
-    using PermTileM = decltype(cute::min(size<0>(TileShapeQK{}), _128{}));
-    using PermTileN = _32;
-    using PermTileK = Int<kHeadDim>;
+    // Strides for GMEM tensors - 3D: (seq, dim, batch*head)
+    using StrideQ = Stride<int64_t, _1, int64_t>;
+    using StrideK = Stride<int64_t, _1, int64_t>;
+    using StrideV = Stride<_1, int64_t, int64_t>;  // V is transposed: (dim, seq, batch*head)
+    using StrideO = Stride<int64_t, _1, int64_t>;
+
+    static constexpr int Alignment = 128 / cute::sizeof_bits_v<Element>;
 
     ///////////////////////////////////////////////////////////////////////////
-    // MMA Configuration (manual, similar to SM120)
-    //
-    // Use SM100 UMMA blockscaled MMA atoms for FP4
-    // For MXF4_NVF4 instruction (FP4 x FP4), the MMA element type is the same as input
-    // (no SMEM unpacking transformation needed, unlike MXF8F6F4)
+    // Use CollectiveBuilder to get correct configurations
     ///////////////////////////////////////////////////////////////////////////
 
-    // MMA input element type - for MXF4 instruction with FP4, use the element type directly
-    // This matches sm100_kernel_input_element_to_mma_input_element<Element, false>() behavior
-    using ElementQMma = Element;
-    using ElementKMma = Element;
+    using CollectiveMmaQK = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+        Element, StrideQ, Alignment,
+        Element, StrideK, Alignment,
+        ElementAccum,
+        TileShapeQK, ClusterShape_MNK,
+        cutlass::gemm::collective::StageCount<kStageCountKV>,
+        cutlass::gemm::KernelTmaWarpSpecialized1SmSm100
+    >::CollectiveOp;
 
-    // Atom layout for 128 rows
-    using AtomLayoutMNK = Layout<Shape<_8, _1, _1>>;
+    using CollectiveMmaPV = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+        Element, StrideK, Alignment,
+        Element, decltype(select<1,0,2>(StrideV{})), Alignment,
+        ElementAccum,
+        TileShapePV, ClusterShape_MNK,
+        cutlass::gemm::collective::StageCount<kStageCountKV>,
+        cutlass::gemm::KernelTmaWarpSpecialized1SmSm100
+    >::CollectiveOp;
 
-    // TiledMMA for QK: using SM100 blockscaled atom for FP4
-    // SM100_MMA_MXF4_SS: MXF4 instruction for FP4 with scale factors
-    using TiledMmaQK = decltype(cute::make_tiled_mma(
-        cute::SM100_MMA_MXF4_SS<
-            ElementQMma, ElementKMma, ElementAccum, ElementSF,
-            128,  // M - must be 128 for SM100 1-CTA cluster
-            128,  // N
-            SFVectorSize,
-            UMMA::Major::K,  // A is row-major (K-major)
-            UMMA::Major::K   // B is col-major (K-major for B)
-        >{}
-    ));
+    // Extract MMA types from CollectiveBuilder
+    using TiledMmaQK = typename CollectiveMmaQK::TiledMma;
+    using TiledMmaPV = typename CollectiveMmaPV::TiledMma;
 
-    // TiledMMA for PV (same structure)
-    using TiledMmaPV = decltype(cute::make_tiled_mma(
-        cute::SM100_MMA_MXF4_SS<
-            ElementQMma, ElementKMma, ElementAccum, ElementSF,
-            128,  // M
-            128,  // N
-            SFVectorSize,
-            UMMA::Major::K,
-            UMMA::Major::K
-        >{}
-    ));
+    // Extract SMEM layouts from CollectiveBuilder and adjust staging
+    // CollectiveBuilder creates multi-stage layouts; we extract single-stage for Q
+    using SmemLayoutQFull = typename CollectiveMmaQK::SmemLayoutA;
+    using SmemLayoutKFull = typename CollectiveMmaQK::SmemLayoutB;
+    using SmemLayoutVFull = typename CollectiveMmaPV::SmemLayoutB;
 
-    static constexpr int MMA_NSF = size<2>(typename TiledMmaQK::AtomShape_MNK{}) / SFVectorSize;
+    // For load warp, use the full staged layouts
+    using SmemLayoutQ = SmemLayoutQFull;
+    using SmemLayoutK = SmemLayoutKFull;
+    using SmemLayoutV = SmemLayoutVFull;
 
-    ///////////////////////////////////////////////////////////////////////////
-    // TMA Copy operations
-    ///////////////////////////////////////////////////////////////////////////
-
-    using GmemTiledCopy = SM90_TMA_LOAD;
-    using GmemTiledCopySF = SM90_TMA_LOAD;
-
-    ///////////////////////////////////////////////////////////////////////////
-    // SMEM Layouts (manual, using UMMA layouts directly)
-    ///////////////////////////////////////////////////////////////////////////
-
-    // For FP4 data (K-major), select appropriate swizzle based on HeadDim
-    // Layout_K_SW128_Atom<4-bit> = (8, 256) elements, so HeadDim must be >= 256
-    // Layout_K_SW64_Atom<4-bit>  = (8, 128) elements, so HeadDim must be >= 128
-    // For HeadDim=128 with FP4, use SW64; for HeadDim=256, use SW128
-    using SmemLayoutAtomQ = cute::conditional_t<(kHeadDim >= 256),
-        UMMA::Layout_K_SW128_Atom<Element>,
-        UMMA::Layout_K_SW64_Atom<Element>>;
-    using SmemLayoutAtomK = cute::conditional_t<(kHeadDim >= 256),
-        UMMA::Layout_K_SW128_Atom<Element>,
-        UMMA::Layout_K_SW64_Atom<Element>>;
-    using SmemLayoutAtomV = cute::conditional_t<(kHeadDim >= 256),
-        UMMA::Layout_K_SW128_Atom<Element>,
-        UMMA::Layout_K_SW64_Atom<Element>>;
-
-    // Q: single stage, 2 tiles (for ThreadShape=(2,1,1))
-    using SmemLayoutQ = decltype(tile_to_shape(
-        SmemLayoutAtomQ{},
-        make_shape(get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}))));
-
-    // K: multiple stages
-    using SmemLayoutK = decltype(tile_to_shape(
-        SmemLayoutAtomK{},
-        make_shape(get<1>(TileShapeQK{}), get<2>(TileShapeQK{}), Int<kStageCountKV>{})));
-
-    // V: multiple stages (same layout as K for now)
-    using SmemLayoutV = decltype(tile_to_shape(
-        SmemLayoutAtomV{},
-        make_shape(get<1>(TileShapePV{}), get<2>(TileShapePV{}), Int<kStageCountKV>{})));
-
-    // Output SMEM layout
-    using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<
-        GMMA::Major::K, ElementOut,
-        decltype(cute::get<0>(TileShape_MNK{})),
-        decltype(cute::get<2>(TileShape_MNK{}))>());
+    // Output SMEM layout - 3D for epilogue double buffering (M, K, 2)
+    using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
+        cute::UMMA::Major::K, ElementOut,
+        decltype(cute::get<0>(TileShapeQK{})),
+        decltype(cute::get<2>(TileShapeQK{}))
+    >());
     using SmemLayoutO = decltype(tile_to_shape(
         SmemLayoutAtomO{},
-        select<0, 2>(TileShape_MNK{}),
-        Step<_1, _2>{}));
+        make_shape(get<0>(TileShapeQK{}), get<2>(TileShapeQK{}), _2{}),
+        Step<_2, _1, _3>{}));
 
-    // SMEM copy atoms
-    using SmemCopyAtomQ = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
-    using SmemCopyAtomKV = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
-    using SmemCopyAtomSF = Copy_Atom<UniversalCopy<ElementSF>, ElementSF>;
-
-    ///////////////////////////////////////////////////////////////////////////
-    // Scale Factor Layouts (same as SM120)
-    ///////////////////////////////////////////////////////////////////////////
-
-    using BlkScaledConfig = flash::BlockScaledConfig<SFVectorSize>;
-    using LayoutSF = typename BlkScaledConfig::LayoutSF;
-    using SfAtom = typename BlkScaledConfig::SfAtom;
-    using SmemLayoutAtomSFQ = decltype(BlkScaledConfig::deduce_smem_layoutSFQ(TiledMmaQK{}, TileShape_MNK{}));
-    using SmemLayoutAtomSFK = decltype(BlkScaledConfig::deduce_smem_layoutSFKV(TiledMmaQK{}, TileShape_MNK{}));
-    using SmemLayoutAtomSFV = decltype(BlkScaledConfig::deduce_smem_layoutSFKV(TiledMmaPV{}, TileShape_MNK{}));
+    // Extract TMA descriptors from CollectiveBuilder
+    using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
+    using TMA_K = typename CollectiveMmaQK::Params::TMA_B;
+    using TMA_V = typename CollectiveMmaPV::Params::TMA_B;
 
     ///////////////////////////////////////////////////////////////////////////
-    // Strides for GMEM tensors
+    // Pipeline Types
     ///////////////////////////////////////////////////////////////////////////
 
-    // Row-major strides: (batch, head, seq, dim)
-    using StrideQ = Stride<int64_t, int64_t, int64_t, _1>;
-    using StrideK = Stride<int64_t, int64_t, int64_t, _1>;
-    using StrideV = Stride<int64_t, int64_t, _1, int64_t>;  // V is transposed
-    using StrideO = Stride<int64_t, int64_t, int64_t, _1>;
+    using AtomThrShape = typename CollectiveMmaQK::AtomThrShapeMNK;
 
-    ///////////////////////////////////////////////////////////////////////////
-    // TMA descriptors
-    ///////////////////////////////////////////////////////////////////////////
-
-    // Single-stage tiled SMEM layouts for TMA (just the tile, no staging dimension)
-    using SmemLayoutQTma = decltype(tile_to_shape(
-        SmemLayoutAtomQ{},
-        select<0, 2>(TileShapeQK{})));
-    using SmemLayoutKTma = decltype(tile_to_shape(
-        SmemLayoutAtomK{},
-        select<1, 2>(TileShapeQK{})));
-    using SmemLayoutVTma = decltype(tile_to_shape(
-        SmemLayoutAtomV{},
-        select<1, 2>(TileShapePV{})));
-
-    // TMA strides for 2D tensor access (seq x dim for each batch/head)
-    // TMA loads 2D tiles, so we use 2D strides
-    using StrideTmaQ = Stride<int64_t, _1>;  // (seq_stride, dim_stride=1)
-    using StrideTmaK = Stride<int64_t, _1>;
-    using StrideTmaV = Stride<_1, int64_t>;  // V is transposed: (dim_stride=1, seq_stride)
-
-    using TMA_Q = decltype(make_tma_copy(
-        SM90_TMA_LOAD{},
-        make_tensor(static_cast<Element const*>(nullptr), make_shape(1, 1), StrideTmaQ{}),
-        SmemLayoutQTma{},
-        select<0, 2>(TileShapeQK{}),
-        _1{}));
-
-    using TMA_K = decltype(make_tma_copy(
-        SM90_TMA_LOAD{},
-        make_tensor(static_cast<Element const*>(nullptr), make_shape(1, 1), StrideTmaK{}),
-        SmemLayoutKTma{},
-        select<1, 2>(TileShapeQK{}),
-        _1{}));
-
-    using TMA_V = decltype(make_tma_copy(
-        SM90_TMA_LOAD{},
-        make_tensor(static_cast<Element const*>(nullptr), make_shape(1, 1), StrideTmaV{}),
-        SmemLayoutVTma{},
-        select<1, 2>(TileShapePV{}),
-        _1{}));
-
-    ///////////////////////////////////////////////////////////////////////////
-    // Pipeline Types (using simpler PipelineAsync for SM100)
-    ///////////////////////////////////////////////////////////////////////////
-
-    // TMA async pipeline for Q loads
-    using PipelineQ = cutlass::PipelineTmaAsync<kStageCountQ>;
-
-    // TMA async pipeline for K/V loads
-    using PipelineKV = cutlass::PipelineTmaAsync<kStageCountKV>;
-
-    // Async pipeline for S (MMA -> Softmax)
+    using PipelineQ = cutlass::PipelineTmaUmmaAsync<kStageCountQ, AtomThrShape>;
+    using PipelineKV = cutlass::PipelineTmaUmmaAsync<kStageCountKV, AtomThrShape>;
     using PipelineS = cutlass::PipelineAsync<1>;
-
-    // Async pipeline for correction (Softmax -> Correction)
     using PipelineC = cutlass::PipelineAsync<1>;
-
-    // Async pipeline for O (MMA -> Correction)
     using PipelineO = cutlass::PipelineAsync<2>;
-
-    // Async pipeline for epilogue (Correction -> Epilogue)
     using PipelineE = cutlass::PipelineAsync<2>;
-
-    // Ordered barrier for softmax warps
     using OrderBarrierSoftmax = cutlass::OrderedSequenceBarrier<1, 2>;
 
     ///////////////////////////////////////////////////////////////////////////
@@ -449,13 +253,28 @@ struct Flash_fwd_kernel_traits_sm100 {
     // Shared Storage
     ///////////////////////////////////////////////////////////////////////////
 
-    // K and V share SMEM - use whichever layout is larger
-    // For now, use K's layout (they should be similar size)
-    using SmemLayoutKV = SmemLayoutK;
+    struct SharedStorage : cute::aligned_struct<128, _0> {
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
+        union {
+            cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
+            cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
+        };
+        cute::array_aligned<ElementOut, cute::cosize_v<SmemLayoutO>> smem_o;
 
-    using SharedStorage = SharedStorageSm100<
-        Element, ElementOut, SmemLayoutQ, SmemLayoutKV, SmemLayoutO,
-        kStageCountQ, kStageCountKV>;
+        struct {
+            alignas(16) typename PipelineQ::SharedStorage pipeline_q;
+            alignas(16) typename PipelineKV::SharedStorage pipeline_kv;
+            alignas(16) typename PipelineS::SharedStorage pipeline_s0;
+            alignas(16) typename PipelineS::SharedStorage pipeline_s1;
+            alignas(16) typename PipelineC::SharedStorage pipeline_c0;
+            alignas(16) typename PipelineC::SharedStorage pipeline_c1;
+            alignas(16) typename PipelineO::SharedStorage pipeline_o;
+            alignas(16) typename PipelineE::SharedStorage pipeline_epi;
+            alignas(16) typename OrderBarrierSoftmax::SharedStorage order_s01;
+        } pipelines;
+
+        uint32_t tmem_base_ptr;
+    };
 
     ///////////////////////////////////////////////////////////////////////////
     // Legacy compatibility

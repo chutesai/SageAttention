@@ -40,8 +40,12 @@ struct CollectiveEpilogueFwdSm100 {
 
     using ElementOut = typename Ktraits::ElementOut;
     using TileShape = typename Ktraits::TileShape_MNK;
+    using TileShapeQK = typename Ktraits::TileShapeQK;
     using SmemLayoutO = typename Ktraits::SmemLayoutO;
     using PipelineE = typename Ktraits::PipelineE;
+
+    // Stride for O in GMEM: (seq_stride, dim_stride=1, batch_head_stride)
+    using StrideO = cute::Stride<int64_t, _1, int64_t>;
 
     ///////////////////////////////////////////////////////////////////////////
     // Parameters
@@ -55,11 +59,12 @@ struct CollectiveEpilogueFwdSm100 {
     };
 
     // TMA descriptor for storing O
+    // SmemLayoutO is 3D (M, K, 2), slice with (_,_,_0{}) to get 2D for TMA
     using TMA_O = decltype(make_tma_copy(
         SM90_TMA_STORE{},
-        make_tensor((ElementOut*)nullptr, repeat_like(cute::Stride<int64_t, _1, int64_t>{}, 0),
-                    cute::Stride<int64_t, _1, int64_t>{}),
-        SmemLayoutO{}(_, _, _0{})));
+        make_tensor((ElementOut*)nullptr, repeat_like(StrideO{}, 0), StrideO{}),
+        SmemLayoutO{}(_, _, _0{})
+    ));
 
     struct Params {
         TMA_O tma_store_o;
@@ -72,13 +77,17 @@ struct CollectiveEpilogueFwdSm100 {
         void* workspace
     ) {
         auto ptr_O = args.ptr_O;
+        // Stride: (seq_stride, dim_stride=1, head_stride)
+        // batch*heads are linearized in the 3rd dimension
         auto stride_O = make_stride(args.stride_O_row, _1{}, args.stride_O_head);
+        // Problem shape for O: (seqlen_q, head_dim, batch*heads)
         auto problem_shape_O = select<0, 2, 3>(problem_shape);
 
         auto tma_store_o = make_tma_copy(
             SM90_TMA_STORE{},
             make_tensor(ptr_O, problem_shape_O, stride_O),
-            SmemLayoutO{}(_, _, _0{}));
+            SmemLayoutO{}(_, _, _0{})
+        );
 
         return Params{tma_store_o};
     }
@@ -106,19 +115,23 @@ struct CollectiveEpilogueFwdSm100 {
 
         uint32_t lane_predicate = cute::elect_one_sync();
 
+        // Two Q blocks per CTA tile (ThreadShape = (2,1,1))
         int o0_index = 2 * get<0>(blk_coord);
         int o1_index = 2 * get<0>(blk_coord) + 1;
 
-        // Get TMA tensor for O
+        // Get TMA tensor for O - problem_shape_O = (seqlen_q, head_dim, batch*heads)
         Tensor mO = params.tma_store_o.get_tma_tensor(select<0, 2, 3>(problem_shape));
-        Tensor gO = local_tile(mO, TileShape{}, make_coord(_, _, _), Step<_1, _1, X>{});
 
-        // Setup SMEM tensor for O
+        // Use TileShapeQK (128, 128, HeadDim) for individual tiles, not full TileShape
+        // local_tile with (M, K, batch) -> tiles along M and K
+        Tensor gO = local_tile(mO, select<0, 2>(TileShapeQK{}), make_coord(_, _, _), Step<_1, _1, X>{});
+
+        // Setup SMEM tensor for O - 3D layout (M, K, 2)
         Tensor sO = make_tensor(make_smem_ptr(storage.smem_o.data()), SmemLayoutO{});
 
         auto block_tma = params.tma_store_o.get_slice(0);
         Tensor tOsO = block_tma.partition_S(sO);
-        Tensor tOgO = block_tma.partition_D(gO(_, _, _, _0{}, get<2>(blk_coord)));
+        Tensor tOgO = block_tma.partition_D(gO(_, _, get<2>(blk_coord)));
 
         auto pipeline_release_state = pipeline_consumer_state;
 
@@ -127,7 +140,7 @@ struct CollectiveEpilogueFwdSm100 {
         ++pipeline_consumer_state;
 
         if (lane_predicate) {
-            copy(params.tma_store_o, tOsO(_, _, _, _0{}), tOgO(_, _, _, o0_index));
+            copy(params.tma_store_o, tOsO(_, _, _0{}), tOgO(_, _, o0_index));
         }
         tma_store_arrive();
 
@@ -136,7 +149,7 @@ struct CollectiveEpilogueFwdSm100 {
         ++pipeline_consumer_state;
 
         if (lane_predicate) {
-            copy(params.tma_store_o, tOsO(_, _, _, _1{}), tOgO(_, _, _, o1_index));
+            copy(params.tma_store_o, tOsO(_, _, _1{}), tOgO(_, _, o1_index));
         }
         tma_store_arrive();
 

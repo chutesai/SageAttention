@@ -60,11 +60,30 @@ void run_flash_fwd_sm100(Flash_fwd_params& params, cudaStream_t stream) {
         params.b * params.h
     );
 
+    // Setup strides - 3D: (seq, dim, batch*head)
+    // For FP4 packed data, q_row_stride is in bytes (dim/2)
+    auto stride_Q = make_stride(
+        static_cast<int64_t>(params.q_row_stride),
+        _1{},
+        static_cast<int64_t>(params.q_head_stride));
+    auto stride_K = make_stride(
+        static_cast<int64_t>(params.k_row_stride),
+        _1{},
+        static_cast<int64_t>(params.k_head_stride));
+    // V is transposed: (dim, seq, batch*head)
+    auto stride_V = make_stride(
+        _1{},
+        static_cast<int64_t>(params.v_row_stride),
+        static_cast<int64_t>(params.v_head_stride));
+
     // Setup mainloop arguments
     typename CollectiveMainloop::Arguments mainloop_args{
         reinterpret_cast<Element const*>(params.q_ptr),
+        stride_Q,
         reinterpret_cast<Element const*>(params.k_ptr),
+        stride_K,
         reinterpret_cast<Element const*>(params.v_ptr),
+        stride_V,
         params.scale_softmax
     };
 

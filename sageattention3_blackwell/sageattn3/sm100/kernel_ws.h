@@ -14,11 +14,6 @@
  * limitations under the License.
  *
  * SM100 (B200/B300) Warp-Specialized Flash Attention Kernel
- *
- * This implements the warp-specialized execution model for SM100:
- *   - 16 warps with specialized roles
- *   - TMEM accumulators for S and O matrices
- *   - Pipelined execution between warp groups
  */
 
 #pragma once
@@ -67,9 +62,16 @@ struct Sm100FlashFwdKernel {
     using PipelineO = typename Ktraits::PipelineO;
     using PipelineE = typename Ktraits::PipelineE;
     using OrderBarrierSoftmax = typename Ktraits::OrderBarrierSoftmax;
+    using ClusterShape = typename Ktraits::ClusterShape_MNK;
 
     static constexpr int kNWarps = Schedule::kNumWarps;
     static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
+
+    // Transaction bytes for TMA loads
+    static constexpr int TransactionBytesLoadQ =
+        cute::cosize_v<typename Ktraits::SmemLayoutQ> * sizeof(Element) / Ktraits::kStageCountQ;
+    static constexpr int TransactionBytesLoadKV =
+        cute::cosize_v<typename Ktraits::SmemLayoutK> * sizeof(Element) / Ktraits::kStageCountKV;
 
     ///////////////////////////////////////////////////////////////////////////
     // Kernel entry point
@@ -82,8 +84,6 @@ struct Sm100FlashFwdKernel {
         typename TileScheduler::Params const& scheduler_params,
         char* smem
     ) {
-        using ClusterShape = typename Ktraits::ClusterShape_MNK;
-
         TileScheduler tile_scheduler;
 
         // Get work tile for this CTA
@@ -112,11 +112,10 @@ struct Sm100FlashFwdKernel {
         }
 
         //
-        // Initialize pipelines directly (cannot return from helper due to deleted copy ctors)
-        // Using simpler PipelineTmaAsync and PipelineAsync for SM100
+        // Initialize pipelines for SM100 UMMA execution
         //
 
-        // Pipeline Q: Load -> MMA (PipelineTmaAsync)
+        // Pipeline Q: Load -> MMA (PipelineTmaUmmaAsync)
         typename PipelineQ::Params pipeline_q_params;
         if (role == WarpRole::Load) {
             pipeline_q_params.role = PipelineQ::ThreadCategory::Producer;
@@ -125,12 +124,13 @@ struct Sm100FlashFwdKernel {
             pipeline_q_params.role = PipelineQ::ThreadCategory::Consumer;
         }
         pipeline_q_params.is_leader = lane_predicate && (role == WarpRole::Load);
-        pipeline_q_params.num_consumers = 1;
+        pipeline_q_params.transaction_bytes = TransactionBytesLoadQ;
         PipelineQ pipeline_q(
             shared_storage.pipelines.pipeline_q,
-            pipeline_q_params, ClusterShape{});
+            pipeline_q_params,
+            ClusterShape{}, cute::true_type{}, cute::false_type{});
 
-        // Pipeline KV: Load -> MMA (PipelineTmaAsync)
+        // Pipeline KV: Load -> MMA (PipelineTmaUmmaAsync)
         typename PipelineKV::Params pipeline_kv_params;
         if (role == WarpRole::Load) {
             pipeline_kv_params.role = PipelineKV::ThreadCategory::Producer;
@@ -139,10 +139,11 @@ struct Sm100FlashFwdKernel {
             pipeline_kv_params.role = PipelineKV::ThreadCategory::Consumer;
         }
         pipeline_kv_params.is_leader = lane_predicate && (role == WarpRole::Load);
-        pipeline_kv_params.num_consumers = 1;
+        pipeline_kv_params.transaction_bytes = TransactionBytesLoadKV;
         PipelineKV pipeline_kv(
             shared_storage.pipelines.pipeline_kv,
-            pipeline_kv_params, ClusterShape{});
+            pipeline_kv_params,
+            ClusterShape{}, cute::true_type{}, cute::false_type{});
 
         // Pipeline S0: MMA -> Softmax0 (PipelineAsync)
         typename PipelineS::Params pipeline_s0_params;
@@ -152,12 +153,11 @@ struct Sm100FlashFwdKernel {
         if (role == WarpRole::Softmax0) {
             pipeline_s0_params.role = PipelineS::ThreadCategory::Consumer;
         }
-        pipeline_s0_params.producer_arv_count = 1;  // MMA warp
-        pipeline_s0_params.consumer_arv_count =
-            Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
+        pipeline_s0_params.consumer_arv_count = Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
         PipelineS pipeline_s0(
             shared_storage.pipelines.pipeline_s0,
-            pipeline_s0_params);
+            pipeline_s0_params,
+            ClusterShape{}, cute::true_type{}, cute::false_type{});
 
         // Pipeline S1: MMA -> Softmax1 (PipelineAsync)
         typename PipelineS::Params pipeline_s1_params;
@@ -167,12 +167,11 @@ struct Sm100FlashFwdKernel {
         if (role == WarpRole::Softmax1) {
             pipeline_s1_params.role = PipelineS::ThreadCategory::Consumer;
         }
-        pipeline_s1_params.producer_arv_count = 1;  // MMA warp
-        pipeline_s1_params.consumer_arv_count =
-            Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
+        pipeline_s1_params.consumer_arv_count = Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
         PipelineS pipeline_s1(
             shared_storage.pipelines.pipeline_s1,
-            pipeline_s1_params);
+            pipeline_s1_params,
+            ClusterShape{}, cute::true_type{}, cute::false_type{});
 
         // Pipeline C0: Softmax0 -> Correction (PipelineAsync)
         typename PipelineC::Params pipeline_c0_params;
@@ -182,13 +181,12 @@ struct Sm100FlashFwdKernel {
         if (role == WarpRole::Correction) {
             pipeline_c0_params.role = PipelineC::ThreadCategory::Consumer;
         }
-        pipeline_c0_params.producer_arv_count =
-            Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
-        pipeline_c0_params.consumer_arv_count =
-            Schedule::kNumWarpsCorrection * cutlass::NumThreadsPerWarp;
+        pipeline_c0_params.producer_arv_count = Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
+        pipeline_c0_params.consumer_arv_count = Schedule::kNumWarpsCorrection * cutlass::NumThreadsPerWarp;
         PipelineC pipeline_c0(
             shared_storage.pipelines.pipeline_c0,
-            pipeline_c0_params);
+            pipeline_c0_params,
+            cute::true_type{});
 
         // Pipeline C1: Softmax1 -> Correction (PipelineAsync)
         typename PipelineC::Params pipeline_c1_params;
@@ -198,15 +196,14 @@ struct Sm100FlashFwdKernel {
         if (role == WarpRole::Correction) {
             pipeline_c1_params.role = PipelineC::ThreadCategory::Consumer;
         }
-        pipeline_c1_params.producer_arv_count =
-            Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
-        pipeline_c1_params.consumer_arv_count =
-            Schedule::kNumWarpsCorrection * cutlass::NumThreadsPerWarp;
+        pipeline_c1_params.producer_arv_count = Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
+        pipeline_c1_params.consumer_arv_count = Schedule::kNumWarpsCorrection * cutlass::NumThreadsPerWarp;
         PipelineC pipeline_c1(
             shared_storage.pipelines.pipeline_c1,
-            pipeline_c1_params);
+            pipeline_c1_params,
+            cute::true_type{});
 
-        // Pipeline O: MMA -> Correction (PipelineAsync)
+        // Pipeline O: MMA -> Correction (PipelineAsync with cluster)
         typename PipelineO::Params pipeline_o_params;
         if (role == WarpRole::MMA) {
             pipeline_o_params.role = PipelineO::ThreadCategory::Producer;
@@ -214,12 +211,11 @@ struct Sm100FlashFwdKernel {
         if (role == WarpRole::Correction) {
             pipeline_o_params.role = PipelineO::ThreadCategory::Consumer;
         }
-        pipeline_o_params.producer_arv_count = 1;  // MMA warp
-        pipeline_o_params.consumer_arv_count =
-            Schedule::kNumWarpsCorrection * cutlass::NumThreadsPerWarp;
+        pipeline_o_params.consumer_arv_count = Schedule::kNumWarpsCorrection * cutlass::NumThreadsPerWarp;
         PipelineO pipeline_o(
             shared_storage.pipelines.pipeline_o,
-            pipeline_o_params);
+            pipeline_o_params,
+            ClusterShape{}, cute::true_type{}, cute::false_type{});
 
         // Pipeline Epi: Correction -> Epilogue (PipelineAsync)
         typename PipelineE::Params pipeline_epi_params;
@@ -229,19 +225,17 @@ struct Sm100FlashFwdKernel {
         if (role == WarpRole::Epilogue) {
             pipeline_epi_params.role = PipelineE::ThreadCategory::Consumer;
         }
-        pipeline_epi_params.producer_arv_count =
-            Schedule::kNumWarpsCorrection * cutlass::NumThreadsPerWarp;
-        pipeline_epi_params.consumer_arv_count =
-            Schedule::kNumWarpsEpilogue * cutlass::NumThreadsPerWarp;
+        pipeline_epi_params.producer_arv_count = Schedule::kNumWarpsCorrection * cutlass::NumThreadsPerWarp;
+        pipeline_epi_params.consumer_arv_count = Schedule::kNumWarpsEpilogue * cutlass::NumThreadsPerWarp;
         PipelineE pipeline_epi(
             shared_storage.pipelines.pipeline_epi,
-            pipeline_epi_params);
+            pipeline_epi_params,
+            cute::true_type{});
 
         // Ordered barrier for softmax warps
         typename OrderBarrierSoftmax::Params order_s01_params;
         order_s01_params.group_id = (role == WarpRole::Softmax1) ? 1 : 0;
-        order_s01_params.group_size =
-            Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
+        order_s01_params.group_size = Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
         OrderBarrierSoftmax order_s01(
             shared_storage.pipelines.order_s01, order_s01_params);
 
@@ -250,8 +244,12 @@ struct Sm100FlashFwdKernel {
 
         __syncthreads();
 
-        // Note: PipelineTmaAsync and PipelineAsync don't need init_masks
-        // (that's specific to PipelineUmmaAsync)
+        // Initialize pipeline masks for UMMA pipelines
+        pipeline_q.init_masks(ClusterShape{});
+        pipeline_kv.init_masks(ClusterShape{});
+        pipeline_s0.init_masks(ClusterShape{});
+        pipeline_s1.init_masks(ClusterShape{});
+        pipeline_o.init_masks(ClusterShape{});
 
         // Initialize pipeline states
         typename PipelineQ::PipelineState pipeline_q_consumer_state;
@@ -289,9 +287,8 @@ struct Sm100FlashFwdKernel {
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
 
-        // Dispatch based on warp role - each CTA processes one tile
+        // Dispatch based on warp role
         if (role == WarpRole::Softmax0 || role == WarpRole::Softmax1) {
-            // Softmax warps: compute online softmax on S matrices
             cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsSoftmax>();
 
             bool is_softmax_0 = (role == WarpRole::Softmax0);
@@ -307,7 +304,6 @@ struct Sm100FlashFwdKernel {
             );
         }
         else if (role == WarpRole::Correction) {
-            // Correction warps: rescale O accumulators based on new row maxes
             cutlass::arch::warpgroup_reg_dealloc<Schedule::kNumRegsCorrection>();
 
             mainloop.correction(
@@ -320,17 +316,14 @@ struct Sm100FlashFwdKernel {
                 pipeline_epi, pipeline_epi_producer_state
             );
 
-            // Free TMEM if epilogue is done in correction warp
             if constexpr (Schedule::kNumWarpsEpilogue == 0) {
                 uint32_t free_ptr = shared_storage.tmem_base_ptr;
                 tmem_allocator.free(free_ptr, TmemAllocator::Sm100TmemCapacityColumns);
             }
         }
         else if (role == WarpRole::MMA) {
-            // MMA warp: compute QK^T and PV matrix products
             cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
 
-            // Allocate TMEM
             tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns,
                                     &shared_storage.tmem_base_ptr);
             __syncwarp();
@@ -347,7 +340,6 @@ struct Sm100FlashFwdKernel {
             );
         }
         else if (role == WarpRole::Load) {
-            // Load warp: issue TMA loads for Q, K, V
             cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
 
             mainloop.load(
@@ -359,7 +351,6 @@ struct Sm100FlashFwdKernel {
             );
         }
         else if (role == WarpRole::Epilogue) {
-            // Epilogue warp: TMA store output O
             cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
 
             epilogue.store(
@@ -369,23 +360,17 @@ struct Sm100FlashFwdKernel {
                 pipeline_epi, pipeline_epi_consumer_state
             );
 
-            // Free TMEM
             if constexpr (Schedule::kNumWarpsEpilogue == 1) {
                 uint32_t free_ptr = shared_storage.tmem_base_ptr;
                 tmem_allocator.free(free_ptr, TmemAllocator::Sm100TmemCapacityColumns);
             }
         }
         else if (role == WarpRole::Empty) {
-            // Empty warp: donate registers and exit
             cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsEmpty>();
         }
     }
 
 private:
-
-    ///////////////////////////////////////////////////////////////////////////
-    // Get problem shape from params
-    ///////////////////////////////////////////////////////////////////////////
 
     template <typename BlkCoord>
     CUTLASS_DEVICE auto get_problem_shape(
