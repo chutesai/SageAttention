@@ -151,7 +151,8 @@ def preprocess_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_
     else:
         qm = q.mean(dim=-2, keepdim=True)
         q = q - qm
-    delta_s = torch.matmul(qm, k.transpose(-2, -1)).to(torch.float32).contiguous()
+    # Use float32 for matmul to avoid cuBLAS BF16 issues on SM100
+    delta_s = torch.matmul(qm.float(), k.float().transpose(-2, -1)).contiguous()
     return q, k, v, delta_s
 
 def scale_and_quant_fp4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
