@@ -81,7 +81,8 @@ struct CollectiveMainloopFwdSm100 {
     using TMA_K = typename Ktraits::TMA_K;
     using TMA_V = typename Ktraits::TMA_V;
 
-    using TmemAlloc = Sm100TmemAlloc;
+    // Use TMEM allocation from kernel_traits
+    using TmemAlloc = flash::Sm100TmemAlloc;
 
     ///////////////////////////////////////////////////////////////////////////
     // Parameters
@@ -317,24 +318,24 @@ struct CollectiveMainloopFwdSm100 {
 
         // S0 and S1 in TMEM (alternating for two Q blocks)
         Tensor tStS0 = tStS;
-        tStS0.data() = tStS.data().get() + uint32_t(TmemAlloc::S0);
+        tStS0.data() = tStS.data().get() + static_cast<uint32_t>(TmemAlloc::S0);
         Tensor tStS1 = tStS;
-        tStS1.data() = tStS.data().get() + uint32_t(TmemAlloc::S1);
+        tStS1.data() = tStS.data().get() + static_cast<uint32_t>(TmemAlloc::S1);
 
         // O0 and O1 in TMEM
         Tensor tOtO0 = tOtO;
-        tOtO0.data() = tOtO.data().get() + uint32_t(TmemAlloc::O0);
+        tOtO0.data() = tOtO.data().get() + static_cast<uint32_t>(TmemAlloc::O0);
         Tensor tOtO1 = tOtO;
-        tOtO1.data() = tOtO.data().get() + uint32_t(TmemAlloc::O1);
+        tOtO1.data() = tOtO.data().get() + static_cast<uint32_t>(TmemAlloc::O1);
 
         // P is stored in TMEM overlapping with S (after softmax)
         Tensor sP = make_tensor(make_smem_ptr((Element*)nullptr), typename CollectiveMmaPV::SmemLayoutA{});
         Tensor tOrP = thr_mma_pv.make_fragment_A(sP)(_, _, _, _0{});
 
         Tensor tOrP0 = tOrP;
-        tOrP0.data() = tOrP0.data().get() + uint32_t(TmemAlloc::P0);
+        tOrP0.data() = tOrP0.data().get() + static_cast<uint32_t>(TmemAlloc::P0);
         Tensor tOrP1 = tOrP;
-        tOrP1.data() = tOrP1.data().get() + uint32_t(TmemAlloc::P1);
+        tOrP1.data() = tOrP1.data().get() + static_cast<uint32_t>(TmemAlloc::P1);
 
         int k_index = 0;
         int v_index = 0;
@@ -615,9 +616,9 @@ struct CollectiveMainloopFwdSm100 {
         Tensor tTMEM_LOADVcS = thr_tmem_loadv.partition_D(tScS_v);
 
         Tensor tTMEM_LOADVtS0 = tTMEM_LOADVtS;
-        tTMEM_LOADVtS0.data() = tTMEM_LOADVtS0.data().get() + uint32_t(TmemAlloc::V0);
+        tTMEM_LOADVtS0.data() = tTMEM_LOADVtS0.data().get() + static_cast<uint32_t>(TmemAlloc::V0);
         Tensor tTMEM_LOADVtS1 = tTMEM_LOADVtS;
-        tTMEM_LOADVtS1.data() = tTMEM_LOADVtS1.data().get() + uint32_t(TmemAlloc::V1);
+        tTMEM_LOADVtS1.data() = tTMEM_LOADVtS1.data().get() + static_cast<uint32_t>(TmemAlloc::V1);
 
         // Skip first signal (no correction needed for first iteration)
         pipeline_c0.consumer_wait(pipeline_c0_consumer_state);
@@ -640,7 +641,7 @@ struct CollectiveMainloopFwdSm100 {
 
             pipeline_o.consumer_wait(pipeline_o_consumer_state);
 
-            correction_rescale(scale, uint32_t(TmemAlloc::O0));
+            correction_rescale(scale, static_cast<uint32_t>(TmemAlloc::O0));
 
             pipeline_c1.consumer_release(pipeline_c1_consumer_state);
             ++pipeline_c1_consumer_state;
@@ -659,7 +660,7 @@ struct CollectiveMainloopFwdSm100 {
 
             pipeline_o.consumer_wait(pipeline_o_consumer_state);
 
-            correction_rescale(scale, uint32_t(TmemAlloc::O1));
+            correction_rescale(scale, static_cast<uint32_t>(TmemAlloc::O1));
 
             pipeline_c0.consumer_release(pipeline_c0_consumer_state);
             ++pipeline_c0_consumer_state;
@@ -764,15 +765,15 @@ private:
         TiledMmaQK mma_qk;
         Tensor tScS = mma_qk.get_slice(0).partition_C(cS);
         Tensor tStS = partition_fragment_C(mma_qk, select<0,1>(TileShapeQK{}));
-        tStS.data() = uint32_t(stage == 0 ? TmemAlloc::S0 : TmemAlloc::S1);
+        tStS.data() = static_cast<uint32_t>(stage == 0 ? TmemAlloc::S0 : TmemAlloc::S1);
 
         Tensor tStS_v = tStS.compose(make_layout(make_shape(_128{}, _2{})));
-        tStS_v.data() = uint32_t(stage == 0 ? TmemAlloc::V0 : TmemAlloc::V1);
+        tStS_v.data() = static_cast<uint32_t>(stage == 0 ? TmemAlloc::V0 : TmemAlloc::V1);
         Tensor tScS_v = tScS.compose(make_layout(make_shape(_128{}, _2{})));
 
         auto tilePlikeFP32 = get<1>(TileShapeQK{}) / Int<sizeof(float)>{} * Int<sizeof(Element)>{};
         Tensor tStS_P = tStS.compose(make_layout(make_shape(_128{}, tilePlikeFP32)));
-        tStS_P.data() = warp_uniform(uint32_t(stage == 0 ? TmemAlloc::P0 : TmemAlloc::P1));
+        tStS_P.data() = warp_uniform(static_cast<uint32_t>(stage == 0 ? TmemAlloc::P0 : TmemAlloc::P1));
         Tensor tScS_P = tScS.compose(make_layout(make_shape(_128{}, tilePlikeFP32)));
 
         using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b32x;

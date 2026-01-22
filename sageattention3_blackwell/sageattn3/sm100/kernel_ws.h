@@ -82,6 +82,8 @@ struct Sm100FlashFwdKernel {
         typename TileScheduler::Params const& scheduler_params,
         char* smem
     ) {
+        using ClusterShape = typename Ktraits::ClusterShape_MNK;
+
         TileScheduler tile_scheduler;
 
         // Get work tile for this CTA
@@ -109,164 +111,9 @@ struct Sm100FlashFwdKernel {
             CollectiveEpilogue::prefetch_tma_descriptors(epilogue_params);
         }
 
-        // Initialize pipelines
-        auto [pipeline_q, pipeline_kv, pipeline_s0, pipeline_s1,
-              pipeline_c0, pipeline_c1, pipeline_o, pipeline_epi,
-              order_s01] = init_pipelines(role, lane_predicate, shared_storage);
-
-        // Initialize TMEM allocator
-        TmemAllocator tmem_allocator;
-
-        __syncthreads();
-
-        // Initialize pipeline masks (only for UMMA-based pipelines)
-        pipeline_q.init_masks(typename Ktraits::ClusterShape_MNK{});
-        pipeline_kv.init_masks(typename Ktraits::ClusterShape_MNK{});
-        pipeline_s0.init_masks(typename Ktraits::ClusterShape_MNK{});
-        pipeline_s1.init_masks(typename Ktraits::ClusterShape_MNK{});
-        pipeline_o.init_masks(typename Ktraits::ClusterShape_MNK{});
-        // Note: PipelineC (pipeline_c0, pipeline_c1) and PipelineE (pipeline_epi)
-        // are PipelineAsync which don't have init_masks
-
-        // Initialize pipeline states
-        typename PipelineQ::PipelineState pipeline_q_consumer_state;
-        typename PipelineQ::PipelineState pipeline_q_producer_state =
-            cutlass::make_producer_start_state<PipelineQ>();
-
-        typename PipelineKV::PipelineState pipeline_kv_consumer_state;
-        typename PipelineKV::PipelineState pipeline_kv_producer_state =
-            cutlass::make_producer_start_state<PipelineKV>();
-
-        typename PipelineS::PipelineState pipeline_s0_consumer_state;
-        typename PipelineS::PipelineState pipeline_s0_producer_state =
-            cutlass::make_producer_start_state<PipelineS>();
-
-        typename PipelineS::PipelineState pipeline_s1_consumer_state;
-        typename PipelineS::PipelineState pipeline_s1_producer_state =
-            cutlass::make_producer_start_state<PipelineS>();
-
-        typename PipelineC::PipelineState pipeline_c0_consumer_state;
-        typename PipelineC::PipelineState pipeline_c0_producer_state =
-            cutlass::make_producer_start_state<PipelineC>();
-
-        typename PipelineC::PipelineState pipeline_c1_consumer_state;
-        typename PipelineC::PipelineState pipeline_c1_producer_state =
-            cutlass::make_producer_start_state<PipelineC>();
-
-        typename PipelineO::PipelineState pipeline_o_consumer_state;
-        typename PipelineO::PipelineState pipeline_o_producer_state =
-            cutlass::make_producer_start_state<PipelineO>();
-
-        typename PipelineE::PipelineState pipeline_epi_consumer_state;
-        typename PipelineE::PipelineState pipeline_epi_producer_state =
-            cutlass::make_producer_start_state<PipelineE>();
-
-        CollectiveMainloop mainloop;
-        CollectiveEpilogue epilogue;
-
-        // Dispatch based on warp role - each CTA processes one tile
-        if (role == WarpRole::Softmax0 || role == WarpRole::Softmax1) {
-            // Softmax warps: compute online softmax on S matrices
-            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsSoftmax>();
-
-            bool is_softmax_0 = (role == WarpRole::Softmax0);
-
-            mainloop.softmax(
-                is_softmax_0 ? 0 : 1, blk_coord,
-                mainloop_params, problem_shape, params,
-                is_softmax_0 ? pipeline_s0 : pipeline_s1,
-                is_softmax_0 ? pipeline_s0_consumer_state : pipeline_s1_consumer_state,
-                is_softmax_0 ? pipeline_c0 : pipeline_c1,
-                is_softmax_0 ? pipeline_c0_producer_state : pipeline_c1_producer_state,
-                order_s01
-            );
-        }
-        else if (role == WarpRole::Correction) {
-            // Correction warps: rescale O accumulators based on new row maxes
-            cutlass::arch::warpgroup_reg_dealloc<Schedule::kNumRegsCorrection>();
-
-            mainloop.correction(
-                blk_coord,
-                mainloop_params, problem_shape, params,
-                shared_storage,
-                pipeline_c0, pipeline_c0_consumer_state,
-                pipeline_c1, pipeline_c1_consumer_state,
-                pipeline_o, pipeline_o_consumer_state,
-                pipeline_epi, pipeline_epi_producer_state
-            );
-
-            // Free TMEM if epilogue is done in correction warp
-            if constexpr (Schedule::kNumWarpsEpilogue == 0) {
-                uint32_t free_ptr = shared_storage.tmem_base_ptr;
-                tmem_allocator.free(free_ptr, TmemAllocator::Sm100TmemCapacityColumns);
-            }
-        }
-        else if (role == WarpRole::MMA) {
-            // MMA warp: compute QK^T and PV matrix products
-            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
-
-            // Allocate TMEM
-            tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns,
-                                    &shared_storage.tmem_base_ptr);
-            __syncwarp();
-
-            mainloop.mma(
-                blk_coord,
-                mainloop_params, problem_shape, params,
-                shared_storage,
-                pipeline_q, pipeline_q_consumer_state,
-                pipeline_kv, pipeline_kv_consumer_state,
-                pipeline_s0, pipeline_s0_producer_state,
-                pipeline_s1, pipeline_s1_producer_state,
-                pipeline_o, pipeline_o_producer_state
-            );
-        }
-        else if (role == WarpRole::Load) {
-            // Load warp: issue TMA loads for Q, K, V
-            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
-
-            mainloop.load(
-                blk_coord, problem_shape,
-                mainloop_params, params,
-                shared_storage,
-                pipeline_q, pipeline_q_producer_state,
-                pipeline_kv, pipeline_kv_producer_state
-            );
-        }
-        else if (role == WarpRole::Epilogue) {
-            // Epilogue warp: TMA store output O
-            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
-
-            epilogue.store(
-                blk_coord, problem_shape,
-                epilogue_params, params,
-                shared_storage,
-                pipeline_epi, pipeline_epi_consumer_state
-            );
-
-            // Free TMEM
-            if constexpr (Schedule::kNumWarpsEpilogue == 1) {
-                uint32_t free_ptr = shared_storage.tmem_base_ptr;
-                tmem_allocator.free(free_ptr, TmemAllocator::Sm100TmemCapacityColumns);
-            }
-        }
-        else if (role == WarpRole::Empty) {
-            // Empty warp: donate registers and exit
-            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsEmpty>();
-        }
-    }
-
-private:
-    ///////////////////////////////////////////////////////////////////////////
-    // Pipeline initialization
-    ///////////////////////////////////////////////////////////////////////////
-
-    CUTLASS_DEVICE auto init_pipelines(
-        WarpRole role,
-        uint32_t lane_predicate,
-        SharedStorage& shared_storage
-    ) {
-        using ClusterShape = typename Ktraits::ClusterShape_MNK;
+        //
+        // Initialize pipelines directly (cannot return from helper due to deleted copy ctors)
+        //
 
         // Pipeline Q: Load -> MMA
         typename PipelineQ::Params pipeline_q_params;
@@ -399,11 +246,149 @@ private:
         OrderBarrierSoftmax order_s01(
             shared_storage.pipelines.order_s01, order_s01_params);
 
-        return cute::make_tuple(
-            pipeline_q, pipeline_kv, pipeline_s0, pipeline_s1,
-            pipeline_c0, pipeline_c1, pipeline_o, pipeline_epi,
-            order_s01);
+        // Initialize TMEM allocator
+        TmemAllocator tmem_allocator;
+
+        __syncthreads();
+
+        // Initialize pipeline masks (only for UMMA-based pipelines)
+        pipeline_q.init_masks(ClusterShape{});
+        pipeline_kv.init_masks(ClusterShape{});
+        pipeline_s0.init_masks(ClusterShape{});
+        pipeline_s1.init_masks(ClusterShape{});
+        pipeline_o.init_masks(ClusterShape{});
+        // Note: PipelineC (pipeline_c0, pipeline_c1) and PipelineE (pipeline_epi)
+        // are PipelineAsync which don't have init_masks
+
+        // Initialize pipeline states
+        typename PipelineQ::PipelineState pipeline_q_consumer_state;
+        typename PipelineQ::PipelineState pipeline_q_producer_state =
+            cutlass::make_producer_start_state<PipelineQ>();
+
+        typename PipelineKV::PipelineState pipeline_kv_consumer_state;
+        typename PipelineKV::PipelineState pipeline_kv_producer_state =
+            cutlass::make_producer_start_state<PipelineKV>();
+
+        typename PipelineS::PipelineState pipeline_s0_consumer_state;
+        typename PipelineS::PipelineState pipeline_s0_producer_state =
+            cutlass::make_producer_start_state<PipelineS>();
+
+        typename PipelineS::PipelineState pipeline_s1_consumer_state;
+        typename PipelineS::PipelineState pipeline_s1_producer_state =
+            cutlass::make_producer_start_state<PipelineS>();
+
+        typename PipelineC::PipelineState pipeline_c0_consumer_state;
+        typename PipelineC::PipelineState pipeline_c0_producer_state =
+            cutlass::make_producer_start_state<PipelineC>();
+
+        typename PipelineC::PipelineState pipeline_c1_consumer_state;
+        typename PipelineC::PipelineState pipeline_c1_producer_state =
+            cutlass::make_producer_start_state<PipelineC>();
+
+        typename PipelineO::PipelineState pipeline_o_consumer_state;
+        typename PipelineO::PipelineState pipeline_o_producer_state =
+            cutlass::make_producer_start_state<PipelineO>();
+
+        typename PipelineE::PipelineState pipeline_epi_consumer_state;
+        typename PipelineE::PipelineState pipeline_epi_producer_state =
+            cutlass::make_producer_start_state<PipelineE>();
+
+        CollectiveMainloop mainloop;
+        CollectiveEpilogue epilogue;
+
+        // Dispatch based on warp role - each CTA processes one tile
+        if (role == WarpRole::Softmax0 || role == WarpRole::Softmax1) {
+            // Softmax warps: compute online softmax on S matrices
+            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsSoftmax>();
+
+            bool is_softmax_0 = (role == WarpRole::Softmax0);
+
+            mainloop.softmax(
+                is_softmax_0 ? 0 : 1, blk_coord,
+                mainloop_params, problem_shape, params,
+                is_softmax_0 ? pipeline_s0 : pipeline_s1,
+                is_softmax_0 ? pipeline_s0_consumer_state : pipeline_s1_consumer_state,
+                is_softmax_0 ? pipeline_c0 : pipeline_c1,
+                is_softmax_0 ? pipeline_c0_producer_state : pipeline_c1_producer_state,
+                order_s01
+            );
+        }
+        else if (role == WarpRole::Correction) {
+            // Correction warps: rescale O accumulators based on new row maxes
+            cutlass::arch::warpgroup_reg_dealloc<Schedule::kNumRegsCorrection>();
+
+            mainloop.correction(
+                blk_coord,
+                mainloop_params, problem_shape, params,
+                shared_storage,
+                pipeline_c0, pipeline_c0_consumer_state,
+                pipeline_c1, pipeline_c1_consumer_state,
+                pipeline_o, pipeline_o_consumer_state,
+                pipeline_epi, pipeline_epi_producer_state
+            );
+
+            // Free TMEM if epilogue is done in correction warp
+            if constexpr (Schedule::kNumWarpsEpilogue == 0) {
+                uint32_t free_ptr = shared_storage.tmem_base_ptr;
+                tmem_allocator.free(free_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+            }
+        }
+        else if (role == WarpRole::MMA) {
+            // MMA warp: compute QK^T and PV matrix products
+            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
+
+            // Allocate TMEM
+            tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns,
+                                    &shared_storage.tmem_base_ptr);
+            __syncwarp();
+
+            mainloop.mma(
+                blk_coord,
+                mainloop_params, problem_shape, params,
+                shared_storage,
+                pipeline_q, pipeline_q_consumer_state,
+                pipeline_kv, pipeline_kv_consumer_state,
+                pipeline_s0, pipeline_s0_producer_state,
+                pipeline_s1, pipeline_s1_producer_state,
+                pipeline_o, pipeline_o_producer_state
+            );
+        }
+        else if (role == WarpRole::Load) {
+            // Load warp: issue TMA loads for Q, K, V
+            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
+
+            mainloop.load(
+                blk_coord, problem_shape,
+                mainloop_params, params,
+                shared_storage,
+                pipeline_q, pipeline_q_producer_state,
+                pipeline_kv, pipeline_kv_producer_state
+            );
+        }
+        else if (role == WarpRole::Epilogue) {
+            // Epilogue warp: TMA store output O
+            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
+
+            epilogue.store(
+                blk_coord, problem_shape,
+                epilogue_params, params,
+                shared_storage,
+                pipeline_epi, pipeline_epi_consumer_state
+            );
+
+            // Free TMEM
+            if constexpr (Schedule::kNumWarpsEpilogue == 1) {
+                uint32_t free_ptr = shared_storage.tmem_base_ptr;
+                tmem_allocator.free(free_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+            }
+        }
+        else if (role == WarpRole::Empty) {
+            // Empty warp: donate registers and exit
+            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsEmpty>();
+        }
     }
+
+private:
 
     ///////////////////////////////////////////////////////////////////////////
     // Get problem shape from params
