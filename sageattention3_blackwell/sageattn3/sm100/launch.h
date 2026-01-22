@@ -118,8 +118,22 @@ void run_flash_fwd_sm100(Flash_fwd_params& params, cudaStream_t stream) {
     // Set max dynamic shared memory if needed
     auto kernel = compute_attn_ws_sm100<Ktraits, Is_causal, TileScheduler>;
 
+    // Debug: print launch parameters
+    fprintf(stderr, "SM100 kernel launch: grid=(%d,%d,%d), block=(%d), smem=%d bytes\n",
+            num_m_blocks, params.h, params.b, Ktraits::kNThreads, smem_size);
+    fprintf(stderr, "  seqlen_q=%d, seqlen_k=%d, head_dim=%d, num_m_blocks=%d\n",
+            params.seqlen_q, params.seqlen_k, params.d, num_m_blocks);
+
+    // Query max shared memory
+    int max_smem = 0;
+    cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+    fprintf(stderr, "  max_smem_per_block=%d bytes\n", max_smem);
+
     if (smem_size >= 48 * 1024) {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        cudaError_t attr_err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        if (attr_err != cudaSuccess) {
+            fprintf(stderr, "  cudaFuncSetAttribute failed: %s\n", cudaGetErrorString(attr_err));
+        }
     }
 
     // Calculate grid dimensions
