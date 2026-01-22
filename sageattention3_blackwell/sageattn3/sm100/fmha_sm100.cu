@@ -85,7 +85,8 @@ struct FmhaKernel {
 };
 
 using FmhaNoMask = FmhaKernel<fmha_collective::NoMask>;
-using FmhaCausal = FmhaKernel<fmha_collective::CausalMask>;
+// Temporarily commenting out causal to debug compilation
+// using FmhaCausal = FmhaKernel<fmha_collective::CausalMask>;
 
 ///////////////////////////////////////////////////////////////////////////////
 // Kernel Launch Function
@@ -228,10 +229,10 @@ torch::Tensor fmha_fwd_sm100(
     at::cuda::CUDAGuard device_guard(q.device());
 
     if (is_causal) {
-        return run_fmha_impl<FmhaCausal>(q, k, v, scale);
-    } else {
-        return run_fmha_impl<FmhaNoMask>(q, k, v, scale);
+        // TODO: Add causal support once base kernel compiles
+        TORCH_CHECK(false, "Causal attention not yet implemented for SM100");
     }
+    return run_fmha_impl<FmhaNoMask>(q, k, v, scale);
 }
 
 torch::Tensor fmha_fwd_sm100_auto_scale(
