@@ -122,16 +122,27 @@ struct CollectiveEpilogueFwdSm100 {
         // Get TMA tensor for O - problem_shape_O = (seqlen_q, head_dim, batch*heads)
         Tensor mO = params.tma_store_o.get_tma_tensor(select<0, 2, 3>(problem_shape));
 
-        // Use TileShapeQK (128, 128, HeadDim) for individual tiles, not full TileShape
-        // local_tile with (M, K, batch) -> tiles along M and K
-        Tensor gO = local_tile(mO, select<0, 2>(TileShapeQK{}), make_coord(_, _, _), Step<_1, _1, X>{});
+        // TileShapeQK is 3D (M, N, K) = (128, 128, HeadDim)
+        // We need a 3D tile shape for O: (M, K, _) where _ is batch dimension
+        // Use select<0,2>(TileShapeQK) for M and K dims, append _1 for batch
+        using TileShapeO = Shape<
+            decltype(get<0>(TileShapeQK{})),  // M = 128
+            decltype(get<2>(TileShapeQK{})),  // K = HeadDim
+            _1                                 // batch = 1 (tiled)
+        >;
+
+        // local_tile with 3D tile shape on 3D tensor
+        Tensor gO_full = local_tile(mO, TileShapeO{}, make_coord(_, _, _), Step<_1, _1, X>{});
+
+        // Select the batch slice for this block
+        Tensor gO = gO_full(_, _, _, get<2>(blk_coord));
 
         // Setup SMEM tensor for O - 3D layout (M, K, 2)
         Tensor sO = make_tensor(make_smem_ptr(storage.smem_o.data()), SmemLayoutO{});
 
         auto block_tma = params.tma_store_o.get_slice(0);
         Tensor tOsO = block_tma.partition_S(sO);
-        Tensor tOgO = block_tma.partition_D(gO(_, _, get<2>(blk_coord)));
+        Tensor tOgO = block_tma.partition_D(gO);
 
         auto pipeline_release_state = pipeline_consumer_state;
 

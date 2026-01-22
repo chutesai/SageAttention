@@ -28,6 +28,7 @@
 #include "cutlass/layout/layout.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/pipeline/pipeline.hpp"
+#include "cutlass/pipeline/sm90_pipeline.hpp"
 #include "cutlass/pipeline/sm100_pipeline.hpp"
 
 #include "cutlass/gemm/collective/collective_builder.hpp"
@@ -124,7 +125,7 @@ template <
     int kStages_,
     int kClusterM_,
     bool BlockMean_,
-    typename Element_ = cutlass::float_e2m1_t,      // FP4 E2M1 data
+    typename ElementPacked_ = uint8_t,              // Packed FP4 (2 values per byte)
     typename ElementOut_ = cutlass::bfloat16_t
 >
 struct Flash_fwd_kernel_traits_sm100 {
@@ -150,8 +151,10 @@ struct Flash_fwd_kernel_traits_sm100 {
     static constexpr int kStageCountQ = 2;
     static constexpr int kStageCountKV = kStages_;
 
-    // Element types
-    using Element = Element_;
+    // Element types - use bfloat16 for CollectiveBuilder (standard non-blockscaled path)
+    // The actual FP4 blockscaled requires a different approach
+    using ElementPacked = ElementPacked_;
+    using Element = cutlass::bfloat16_t;  // Use BF16 for standard UMMA path
     using ElementAccum = float;
     using ElementOut = ElementOut_;
     using index_t = int64_t;
@@ -235,11 +238,20 @@ struct Flash_fwd_kernel_traits_sm100 {
 
     using AtomThrShape = typename CollectiveMmaQK::AtomThrShapeMNK;
 
+    // From Load to MMA warp (TMA loads Q/K/V into SMEM)
     using PipelineQ = cutlass::PipelineTmaUmmaAsync<kStageCountQ, AtomThrShape>;
     using PipelineKV = cutlass::PipelineTmaUmmaAsync<kStageCountKV, AtomThrShape>;
-    using PipelineS = cutlass::PipelineAsync<1>;
+
+    // From MMA to Softmax0/1 warps (protects S in TMEM) - uses UMMA peer signaling
+    using PipelineS = cutlass::PipelineUmmaAsync<1, AtomThrShape>;
+
+    // From Softmax0/1 to Correction warps (simple async barrier)
     using PipelineC = cutlass::PipelineAsync<1>;
-    using PipelineO = cutlass::PipelineAsync<2>;
+
+    // From MMA to Correction warps (protects O in TMEM) - uses UMMA peer signaling
+    using PipelineO = cutlass::PipelineUmmaAsync<2, AtomThrShape>;
+
+    // From Correction to Epilogue warp (simple async barrier)
     using PipelineE = cutlass::PipelineAsync<2>;
     using OrderBarrierSoftmax = cutlass::OrderedSequenceBarrier<1, 2>;
 

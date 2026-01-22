@@ -145,7 +145,7 @@ struct Sm100FlashFwdKernel {
             pipeline_kv_params,
             ClusterShape{}, cute::true_type{}, cute::false_type{});
 
-        // Pipeline S0: MMA -> Softmax0 (PipelineAsync)
+        // Pipeline S0: MMA -> Softmax0 (PipelineUmmaAsync - TMEM signaling)
         typename PipelineS::Params pipeline_s0_params;
         if (role == WarpRole::MMA) {
             pipeline_s0_params.role = PipelineS::ThreadCategory::Producer;
@@ -159,7 +159,7 @@ struct Sm100FlashFwdKernel {
             pipeline_s0_params,
             ClusterShape{}, cute::true_type{}, cute::false_type{});
 
-        // Pipeline S1: MMA -> Softmax1 (PipelineAsync)
+        // Pipeline S1: MMA -> Softmax1 (PipelineUmmaAsync - TMEM signaling)
         typename PipelineS::Params pipeline_s1_params;
         if (role == WarpRole::MMA) {
             pipeline_s1_params.role = PipelineS::ThreadCategory::Producer;
@@ -173,7 +173,7 @@ struct Sm100FlashFwdKernel {
             pipeline_s1_params,
             ClusterShape{}, cute::true_type{}, cute::false_type{});
 
-        // Pipeline C0: Softmax0 -> Correction (PipelineAsync)
+        // Pipeline C0: Softmax0 -> Correction (PipelineAsync - simple barrier)
         typename PipelineC::Params pipeline_c0_params;
         if (role == WarpRole::Softmax0) {
             pipeline_c0_params.role = PipelineC::ThreadCategory::Producer;
@@ -188,7 +188,7 @@ struct Sm100FlashFwdKernel {
             pipeline_c0_params,
             cute::true_type{});
 
-        // Pipeline C1: Softmax1 -> Correction (PipelineAsync)
+        // Pipeline C1: Softmax1 -> Correction (PipelineAsync - simple barrier)
         typename PipelineC::Params pipeline_c1_params;
         if (role == WarpRole::Softmax1) {
             pipeline_c1_params.role = PipelineC::ThreadCategory::Producer;
@@ -203,7 +203,7 @@ struct Sm100FlashFwdKernel {
             pipeline_c1_params,
             cute::true_type{});
 
-        // Pipeline O: MMA -> Correction (PipelineAsync with cluster)
+        // Pipeline O: MMA -> Correction (PipelineUmmaAsync - TMEM signaling)
         typename PipelineO::Params pipeline_o_params;
         if (role == WarpRole::MMA) {
             pipeline_o_params.role = PipelineO::ThreadCategory::Producer;
@@ -217,7 +217,7 @@ struct Sm100FlashFwdKernel {
             pipeline_o_params,
             ClusterShape{}, cute::true_type{}, cute::false_type{});
 
-        // Pipeline Epi: Correction -> Epilogue (PipelineAsync)
+        // Pipeline Epi: Correction -> Epilogue (PipelineAsync - simple barrier)
         typename PipelineE::Params pipeline_epi_params;
         if (role == WarpRole::Correction) {
             pipeline_epi_params.role = PipelineE::ThreadCategory::Producer;
@@ -244,12 +244,16 @@ struct Sm100FlashFwdKernel {
 
         __syncthreads();
 
-        // Initialize pipeline masks for UMMA pipelines
+        // Initialize pipeline masks for UMMA pipelines (only PipelineTmaUmmaAsync and PipelineUmmaAsync have init_masks)
+        // PipelineQ/KV: PipelineTmaUmmaAsync
         pipeline_q.init_masks(ClusterShape{});
         pipeline_kv.init_masks(ClusterShape{});
+        // PipelineS0/S1: PipelineUmmaAsync
         pipeline_s0.init_masks(ClusterShape{});
         pipeline_s1.init_masks(ClusterShape{});
+        // PipelineO: PipelineUmmaAsync
         pipeline_o.init_masks(ClusterShape{});
+        // Note: PipelineC0/C1/Epi are PipelineAsync which does NOT have init_masks
 
         // Initialize pipeline states
         typename PipelineQ::PipelineState pipeline_q_consumer_state;
