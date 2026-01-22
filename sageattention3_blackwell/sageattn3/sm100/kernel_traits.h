@@ -49,6 +49,16 @@ namespace flash {
 using namespace cute;
 
 ///////////////////////////////////////////////////////////////////////////////
+// Helper to unstage SMEM layout (extract single stage from multi-stage layout)
+// Must be defined before Flash_fwd_kernel_traits_sm100 since it's used in decltype
+///////////////////////////////////////////////////////////////////////////////
+
+template<class Layout, class Stages = _1>
+CUTE_HOST_DEVICE constexpr auto unstageSmemLayout(Layout const& layout, Stages stages = {}) {
+    return composition(layout, prepend<decltype(rank(layout))::value>(make_layout(stages), _));
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // SM100 Warp Roles
 //
 // SM100 uses warp-specialized execution with 16 warps total:
@@ -374,14 +384,5 @@ struct Flash_fwd_kernel_traits_sm100 {
     static constexpr int EpiStages = 2;
     using EpilogueBarrier = typename flash::OrderedSequenceBarrierVarGroupSize<EpiStages, 2>;
 };
-
-///////////////////////////////////////////////////////////////////////////////
-// Helper to unstage SMEM layout (extract single stage from multi-stage layout)
-///////////////////////////////////////////////////////////////////////////////
-
-template <class SmemLayout, class StageCount>
-CUTE_HOST_DEVICE constexpr auto unstageSmemLayout(SmemLayout, StageCount) {
-    return SmemLayout{}(_, _, _, cute::Int<0>{});
-}
 
 } // namespace flash

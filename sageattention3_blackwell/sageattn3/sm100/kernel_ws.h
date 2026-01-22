@@ -82,7 +82,18 @@ struct Sm100FlashFwdKernel {
         typename TileScheduler::Params const& scheduler_params,
         char* smem
     ) {
-        TileScheduler tile_scheduler{scheduler_params};
+        TileScheduler tile_scheduler;
+
+        // Get work tile for this CTA
+        auto work_tile_info = tile_scheduler.get_initial_work();
+        auto blk_coord = work_tile_info.get_block_coord(scheduler_params);
+        auto problem_shape = get_problem_shape(params, blk_coord);
+
+        // Early exit if this tile is out of bounds
+        if (!work_tile_info.is_valid(scheduler_params) ||
+            get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(problem_shape)) {
+            return;
+        }
 
         int warp_idx = cutlass::canonical_warp_idx_sync();
         auto role = Schedule::warp_idx_to_role(warp_idx);
@@ -153,56 +164,36 @@ struct Sm100FlashFwdKernel {
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
 
-        // Dispatch based on warp role
+        // Dispatch based on warp role - each CTA processes one tile
         if (role == WarpRole::Softmax0 || role == WarpRole::Softmax1) {
             // Softmax warps: compute online softmax on S matrices
             cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsSoftmax>();
 
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-                auto blk_coord = tile_scheduler.get_block_coord();
-                auto problem_shape = get_problem_shape(params, blk_coord);
+            bool is_softmax_0 = (role == WarpRole::Softmax0);
 
-                if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(problem_shape)) {
-                    continue;
-                }
-
-                bool is_softmax_0 = (role == WarpRole::Softmax0);
-
-                mainloop.softmax(
-                    is_softmax_0 ? 0 : 1, blk_coord,
-                    mainloop_params, problem_shape, params,
-                    is_softmax_0 ? pipeline_s0 : pipeline_s1,
-                    is_softmax_0 ? pipeline_s0_consumer_state : pipeline_s1_consumer_state,
-                    is_softmax_0 ? pipeline_c0 : pipeline_c1,
-                    is_softmax_0 ? pipeline_c0_producer_state : pipeline_c1_producer_state,
-                    order_s01
-                );
-            }
+            mainloop.softmax(
+                is_softmax_0 ? 0 : 1, blk_coord,
+                mainloop_params, problem_shape, params,
+                is_softmax_0 ? pipeline_s0 : pipeline_s1,
+                is_softmax_0 ? pipeline_s0_consumer_state : pipeline_s1_consumer_state,
+                is_softmax_0 ? pipeline_c0 : pipeline_c1,
+                is_softmax_0 ? pipeline_c0_producer_state : pipeline_c1_producer_state,
+                order_s01
+            );
         }
         else if (role == WarpRole::Correction) {
             // Correction warps: rescale O accumulators based on new row maxes
             cutlass::arch::warpgroup_reg_dealloc<Schedule::kNumRegsCorrection>();
 
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-                auto blk_coord = tile_scheduler.get_block_coord();
-                auto problem_shape = get_problem_shape(params, blk_coord);
-
-                if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(problem_shape)) {
-                    continue;
-                }
-
-                mainloop.correction(
-                    blk_coord,
-                    mainloop_params, problem_shape, params,
-                    shared_storage,
-                    pipeline_c0, pipeline_c0_consumer_state,
-                    pipeline_c1, pipeline_c1_consumer_state,
-                    pipeline_o, pipeline_o_consumer_state,
-                    pipeline_epi, pipeline_epi_producer_state
-                );
-            }
+            mainloop.correction(
+                blk_coord,
+                mainloop_params, problem_shape, params,
+                shared_storage,
+                pipeline_c0, pipeline_c0_consumer_state,
+                pipeline_c1, pipeline_c1_consumer_state,
+                pipeline_o, pipeline_o_consumer_state,
+                pipeline_epi, pipeline_epi_producer_state
+            );
 
             // Free TMEM if epilogue is done in correction warp
             if constexpr (Schedule::kNumWarpsEpilogue == 0) {
@@ -219,69 +210,39 @@ struct Sm100FlashFwdKernel {
                                     &shared_storage.tmem_base_ptr);
             __syncwarp();
 
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-                auto blk_coord = tile_scheduler.get_block_coord();
-                auto problem_shape = get_problem_shape(params, blk_coord);
-
-                if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(problem_shape)) {
-                    continue;
-                }
-
-                mainloop.mma(
-                    blk_coord,
-                    mainloop_params, problem_shape, params,
-                    shared_storage,
-                    pipeline_q, pipeline_q_consumer_state,
-                    pipeline_kv, pipeline_kv_consumer_state,
-                    pipeline_s0, pipeline_s0_producer_state,
-                    pipeline_s1, pipeline_s1_producer_state,
-                    pipeline_o, pipeline_o_producer_state
-                );
-            }
+            mainloop.mma(
+                blk_coord,
+                mainloop_params, problem_shape, params,
+                shared_storage,
+                pipeline_q, pipeline_q_consumer_state,
+                pipeline_kv, pipeline_kv_consumer_state,
+                pipeline_s0, pipeline_s0_producer_state,
+                pipeline_s1, pipeline_s1_producer_state,
+                pipeline_o, pipeline_o_producer_state
+            );
         }
         else if (role == WarpRole::Load) {
             // Load warp: issue TMA loads for Q, K, V
             cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
 
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-                auto blk_coord = tile_scheduler.get_block_coord();
-                auto problem_shape = get_problem_shape(params, blk_coord);
-
-                if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(problem_shape)) {
-                    continue;
-                }
-
-                mainloop.load(
-                    blk_coord, problem_shape,
-                    mainloop_params, params,
-                    shared_storage,
-                    pipeline_q, pipeline_q_producer_state,
-                    pipeline_kv, pipeline_kv_producer_state
-                );
-            }
+            mainloop.load(
+                blk_coord, problem_shape,
+                mainloop_params, params,
+                shared_storage,
+                pipeline_q, pipeline_q_producer_state,
+                pipeline_kv, pipeline_kv_producer_state
+            );
         }
         else if (role == WarpRole::Epilogue) {
             // Epilogue warp: TMA store output O
             cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
 
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-                auto blk_coord = tile_scheduler.get_block_coord();
-                auto problem_shape = get_problem_shape(params, blk_coord);
-
-                if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(problem_shape)) {
-                    continue;
-                }
-
-                epilogue.store(
-                    blk_coord, problem_shape,
-                    epilogue_params, params,
-                    shared_storage,
-                    pipeline_epi, pipeline_epi_consumer_state
-                );
-            }
+            epilogue.store(
+                blk_coord, problem_shape,
+                epilogue_params, params,
+                shared_storage,
+                pipeline_epi, pipeline_epi_consumer_state
+            );
 
             // Free TMEM
             if constexpr (Schedule::kNumWarpsEpilogue == 1) {
