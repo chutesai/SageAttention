@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 import argparse
 import sys
+import os
 
 # Import SageAttention3
 try:
@@ -25,6 +26,44 @@ def reference_attention(q, k, v, is_causal=False):
     SDPA works on B200 (uses Flash Attention backend, not cuBLAS).
     """
     return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+
+
+def test_preprocessing_only():
+    """Test just the preprocessing and quantization steps (no kernel)."""
+    from sageattn3.api import (
+        preprocess_qkv, scale_and_quant_fp4, scale_and_quant_fp4_permute,
+        scale_and_quant_fp4_transpose
+    )
+
+    print("Testing preprocessing pipeline (no kernel)...")
+
+    B, H, S, D = 1, 32, 512, 128
+    dtype = torch.bfloat16
+
+    q = torch.randn(B, H, S, D, dtype=dtype, device="cuda")
+    k = torch.randn(B, H, S, D, dtype=dtype, device="cuda")
+    v = torch.randn(B, H, S, D, dtype=dtype, device="cuda")
+
+    try:
+        # Test preprocess
+        q_p, k_p, v_p, delta_s = preprocess_qkv(q, k, v, per_block_mean=True)
+        print(f"  preprocess_qkv: PASS")
+        print(f"    q: {q_p.shape}, k: {k_p.shape}, v: {v_p.shape}, delta_s: {delta_s.shape}")
+
+        # Test quantization
+        q_fp4, q_scale = scale_and_quant_fp4(q_p)
+        print(f"  scale_and_quant_fp4 (Q): PASS - {q_fp4.shape}, {q_scale.shape}")
+
+        k_fp4, k_scale = scale_and_quant_fp4_permute(k_p)
+        print(f"  scale_and_quant_fp4_permute (K): PASS - {k_fp4.shape}, {k_scale.shape}")
+
+        v_fp4, v_scale = scale_and_quant_fp4_transpose(v_p)
+        print(f"  scale_and_quant_fp4_transpose (V): PASS - {v_fp4.shape}, {v_scale.shape}")
+
+        return True
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        return False
 
 
 def compute_error_metrics(output, reference):
@@ -106,6 +145,8 @@ def main():
     parser = argparse.ArgumentParser(description='SM100 SageAttention3 Correctness Tests')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     parser.add_argument('--quick', action='store_true', help='Quick test (fewer configs)')
+    parser.add_argument('--preprocess-only', action='store_true',
+                        help='Only test preprocessing (skip kernel)')
     args = parser.parse_args()
 
     # Check GPU
@@ -119,6 +160,11 @@ def main():
     print(f"Compute Capability: {arch[0]}.{arch[1]}")
     print(f"SM100 (B200/B300): {is_sm100()}")
     print()
+
+    # Test preprocessing only mode
+    if args.preprocess_only:
+        success = test_preprocessing_only()
+        sys.exit(0 if success else 1)
 
     # Test configurations
     if args.quick:
