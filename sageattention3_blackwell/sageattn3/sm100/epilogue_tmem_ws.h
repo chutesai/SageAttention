@@ -108,7 +108,7 @@ struct CollectiveEpilogueFwdSm100 {
 
     ///////////////////////////////////////////////////////////////////////////
     // Store function (executed by Epilogue warp)
-    // Simplified approach: work with 2D slices after selecting batch dimension
+    // Following CUTLASS example 77 pattern exactly.
     ///////////////////////////////////////////////////////////////////////////
 
     template <typename BlkCoord, typename ProblemShape, typename TensorStorage_>
@@ -133,26 +133,27 @@ struct CollectiveEpilogueFwdSm100 {
         // Get TMA tensor for O - problem_shape_O = (seqlen_q, head_dim, batch*heads)
         Tensor mO = params.tma_store_o.get_tma_tensor(select<0, 2, 3>(problem_shape));
 
-        // First slice out the batch dimension to get a 2D tensor (seqlen_q, head_dim)
-        Tensor mO_2d = mO(_, _, batch_head_idx);
+        // local_tile with TileShape on 3D mO tensor
+        // TileShape is 3D: (M, K, _1)
+        // Step<_1, _1, X> means: tile along M and K, don't tile along batch
+        // Result has 5 modes: (TileM, TileK, num_tiles_m, num_tiles_k=1, batch*heads)
+        Tensor gO_qdl = local_tile(mO, TileShape{}, make_coord(_, _, _), Step<_1, _1, X>{});
 
-        // Use 2D tile shape for 2D tensor
-        using TileShape2D = Shape<
-            decltype(get<0>(TileShapeQK{})),  // M = 128
-            decltype(get<2>(TileShapeQK{}))   // K = HeadDim
-        >;
-
-        // local_tile with 2D TileShape on 2D tensor -> 4 modes: (TileM, TileK, num_tiles_m, num_tiles_k)
-        // But num_tiles_k should be 1 since K = HeadDim
-        Tensor gO_tiled = local_tile(mO_2d, TileShape2D{}, make_coord(_, _), Step<_1, X>{});
-        // gO_tiled has shape: (TileM, TileK, num_tiles_m) since we only tile along M
+        // Select specific batch and collapse k-tiles dimension (which is 1)
+        // gO has 3 modes after selection: (TileM, TileK, num_tiles_m)
+        Tensor gO = gO_qdl(_, _, _, _0{}, batch_head_idx);
 
         // Setup SMEM tensor for O - 3D layout (M, K, 2)
         Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
 
+        // Partition for TMA - get_slice(0) since single thread does TMA
         auto block_tma = params.tma_store_o.get_slice(0);
         Tensor tOsO = block_tma.partition_S(sO);
-        Tensor tOgO = block_tma.partition_D(gO_tiled);
+        Tensor tOgO = block_tma.partition_D(gO);
+
+        // After partition_S/D with 3-mode tensors, result has 4 modes:
+        // (TMA_box_M, TMA_box_K, outer_M, stage/tile_idx)
+        // We select with 4 indices: (_,_,_,stage/o_index)
 
         auto pipeline_release_state = pipeline_consumer_state;
 
@@ -161,7 +162,7 @@ struct CollectiveEpilogueFwdSm100 {
         ++pipeline_consumer_state;
 
         if (lane_predicate) {
-            copy(params.tma_store_o, tOsO(_, _, _0{}), tOgO(_, _, o0_index));
+            copy(params.tma_store_o, tOsO(_, _, _, _0{}), tOgO(_, _, _, o0_index));
         }
         tma_store_arrive();
 
@@ -170,7 +171,7 @@ struct CollectiveEpilogueFwdSm100 {
         ++pipeline_consumer_state;
 
         if (lane_predicate) {
-            copy(params.tma_store_o, tOsO(_, _, _1{}), tOgO(_, _, o1_index));
+            copy(params.tma_store_o, tOsO(_, _, _, _1{}), tOgO(_, _, _, o1_index));
         }
         tma_store_arrive();
 
