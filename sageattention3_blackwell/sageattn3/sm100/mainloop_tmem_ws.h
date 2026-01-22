@@ -24,6 +24,8 @@
 
 #pragma once
 
+#include <cmath>
+
 #include "cute/tensor.hpp"
 #include "cute/arch/tmem_allocator_sm100.hpp"
 #include "cute/arch/copy_sm100.hpp"
@@ -55,21 +57,23 @@ struct CollectiveMainloopFwdSm100 {
     using Element = typename Ktraits::Element;
     using ElementAccum = typename Ktraits::ElementAccum;
     using ElementOut = typename Ktraits::ElementOut;
+    using ElementSF = typename Ktraits::ElementSF;
 
     using TileShape = typename Ktraits::TileShape_MNK;
     using TileShapeQK = typename Ktraits::TileShapeQK;
     using TileShapePV = typename Ktraits::TileShapePV;
     using ThreadShape = typename Ktraits::ThreadShape;
 
-    using CollectiveMmaQK = typename Ktraits::CollectiveMmaQK;
-    using CollectiveMmaPV = typename Ktraits::CollectiveMmaPV;
+    // MMA types (manually constructed)
     using TiledMmaQK = typename Ktraits::TiledMmaQK;
     using TiledMmaPV = typename Ktraits::TiledMmaPV;
 
+    // SMEM layouts (manually constructed)
     using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
     using SmemLayoutK = typename Ktraits::SmemLayoutK;
     using SmemLayoutV = typename Ktraits::SmemLayoutV;
 
+    // Pipelines
     using PipelineQ = typename Ktraits::PipelineQ;
     using PipelineKV = typename Ktraits::PipelineKV;
     using PipelineS = typename Ktraits::PipelineS;
@@ -77,9 +81,15 @@ struct CollectiveMainloopFwdSm100 {
     using PipelineO = typename Ktraits::PipelineO;
     using OrderBarrierSoftmax = typename Ktraits::OrderBarrierSoftmax;
 
+    // TMA descriptors
     using TMA_Q = typename Ktraits::TMA_Q;
     using TMA_K = typename Ktraits::TMA_K;
     using TMA_V = typename Ktraits::TMA_V;
+
+    // Strides
+    using StrideQ = typename Ktraits::StrideQ;
+    using StrideK = typename Ktraits::StrideK;
+    using StrideV = typename Ktraits::StrideV;
 
     // Use TMEM allocation from kernel_traits
     using TmemAlloc = flash::Sm100TmemAlloc;
@@ -109,29 +119,61 @@ struct CollectiveMainloopFwdSm100 {
         Arguments const& args,
         void* workspace
     ) {
-        auto problem_shape_qk = problem_shape;
+        // Extract dimensions from problem shape: (seqlen_q, seqlen_k, head_dim, batch*heads)
+        auto [seqlen_q, seqlen_k, head_dim, batch_heads] = problem_shape;
 
-        auto params_qk = CollectiveMmaQK::to_underlying_arguments(
-            problem_shape_qk,
-            typename CollectiveMmaQK::Arguments{
-                args.ptr_Q, typename Ktraits::StrideQ{},
-                args.ptr_K, typename Ktraits::StrideK{}
-            }, nullptr);
+        // For FP4, head_dim is in packed bytes (2 values per byte)
+        // The actual tensor shape for TMA is based on packed bytes
+        auto head_dim_packed = head_dim / 2;  // FP4: 2 values per byte
 
-        auto problem_shape_pv = select<0,2,1,3>(problem_shape_qk);
-        auto params_pv = CollectiveMmaPV::to_underlying_arguments(
-            problem_shape_pv,
-            typename CollectiveMmaPV::Arguments{
-                args.ptr_K, typename Ktraits::StrideK{},  // dummy
-                args.ptr_V, select<1,0,2>(typename Ktraits::StrideV{})
-            }, nullptr);
+        // Create GMEM tensors for Q, K, V
+        // Layout: (seq, dim_packed, batch_heads) with dim as innermost
+        // Q: (seqlen_q, head_dim_packed, batch_heads)
+        auto tensor_Q = make_tensor(
+            args.ptr_Q,
+            make_shape(seqlen_q, head_dim_packed, batch_heads),
+            make_stride(head_dim_packed, _1{}, seqlen_q * head_dim_packed));
 
-        float log2_e = static_cast<float>(std::log2(std::exp(1.0)));
+        // K: (seqlen_k, head_dim_packed, batch_heads)
+        auto tensor_K = make_tensor(
+            args.ptr_K,
+            make_shape(seqlen_k, head_dim_packed, batch_heads),
+            make_stride(head_dim_packed, _1{}, seqlen_k * head_dim_packed));
+
+        // V: (head_dim_packed, seqlen_k, batch_heads) - V is transposed for PV gemm
+        auto tensor_V = make_tensor(
+            args.ptr_V,
+            make_shape(head_dim_packed, seqlen_k, batch_heads),
+            make_stride(_1{}, head_dim_packed, seqlen_k * head_dim_packed));
+
+        // Create TMA descriptors
+        auto tma_load_q = make_tma_copy(
+            SM90_TMA_LOAD{},
+            tensor_Q,
+            typename Ktraits::SmemLayoutAtomQ{},
+            select<0, 2>(TileShapeQK{}),
+            _1{});
+
+        auto tma_load_k = make_tma_copy(
+            SM90_TMA_LOAD{},
+            tensor_K,
+            typename Ktraits::SmemLayoutAtomK{},
+            select<1, 2>(TileShapeQK{}),
+            _1{});
+
+        auto tma_load_v = make_tma_copy(
+            SM90_TMA_LOAD{},
+            tensor_V,
+            typename Ktraits::SmemLayoutAtomV{},
+            select<1, 2>(TileShapePV{}),
+            _1{});
+
+        float log2_e = static_cast<float>(M_LOG2E);
 
         return Params{
-            params_qk.tma_load_a,
-            params_qk.tma_load_b,
-            params_pv.tma_load_b,
+            tma_load_q,
+            tma_load_k,
+            tma_load_v,
             args.scale_softmax,
             args.scale_softmax * log2_e
         };
@@ -172,27 +214,31 @@ struct CollectiveMainloopFwdSm100 {
         Tensor gQ = local_tile(mQ, TileShapeQK{}, make_coord(_, _, _), Step<_1, X, _1>{});
         Tensor tSgQ = mma_qk.partition_A(gQ);
         Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
-        auto [tQgQ, tQsQ] = tma_partition(
+        auto [tQgQ_qdl, tQsQ] = tma_partition(
             params.tma_load_q, _0{}, make_layout(_1{}),
             group_modes<0,3>(sQ), group_modes<0,3>(tSgQ));
+        // Extract batch dimension
+        Tensor tQgQ = tQgQ_qdl(_, _, _0{}, get<2>(blk_coord));
 
         // Setup TMA tensors for K
         Tensor mK = params.tma_load_k.get_tma_tensor(select<1,2,3>(problem_shape));
         Tensor gK = local_tile(mK, TileShapeQK{}, make_coord(_, _, _), Step<X, _1, _1>{});
         Tensor tSgK = mma_qk.partition_B(gK);
         Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
-        auto [tKgK, tKsK] = tma_partition(
+        auto [tKgK_kdl, tKsK] = tma_partition(
             params.tma_load_k, _0{}, make_layout(_1{}),
             group_modes<0,3>(sK), group_modes<0,3>(tSgK));
+        Tensor tKgK = tKgK_kdl(_, _, _0{}, get<2>(blk_coord));
 
         // Setup TMA tensors for V
         Tensor mV = params.tma_load_v.get_tma_tensor(select<2,1,3>(problem_shape));
         Tensor gV = local_tile(mV, TileShapePV{}, make_coord(_, _, _), Step<X, _1, _1>{});
         Tensor tOgV = mma_pv.partition_B(gV);
         Tensor sV = make_tensor(make_smem_ptr(storage.smem_v.data()), SmemLayoutV{});
-        auto [tVgV, tVsV] = tma_partition(
+        auto [tVgV_dkl, tVsV] = tma_partition(
             params.tma_load_v, _0{}, make_layout(_1{}),
             group_modes<0,3>(sV), group_modes<0,3>(tOgV));
+        Tensor tVgV = tVgV_dkl(_, _0{}, _, get<2>(blk_coord));
 
         uint32_t lane_predicate = cute::elect_one_sync();
 
@@ -205,7 +251,7 @@ struct CollectiveMainloopFwdSm100 {
         if (lane_predicate) {
             auto tma_barrier = pipeline_q.producer_get_barrier(pipeline_q_producer_state);
             copy(params.tma_load_q.with(*tma_barrier, 0),
-                 tQgQ(_, q0_index, get<2>(blk_coord)),
+                 tQgQ(_, q0_index),
                  tQsQ(_, pipeline_q_producer_state.index()));
         }
         ++pipeline_q_producer_state;
@@ -216,7 +262,7 @@ struct CollectiveMainloopFwdSm100 {
         if (lane_predicate) {
             auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
             copy(params.tma_load_k.with(*tma_barrier, 0),
-                 tKgK(_, k_index, get<2>(blk_coord)),
+                 tKgK(_, k_index),
                  tKsK(_, pipeline_kv_producer_state.index()));
         }
         ++pipeline_kv_producer_state;
@@ -226,7 +272,7 @@ struct CollectiveMainloopFwdSm100 {
         if (lane_predicate) {
             auto tma_barrier = pipeline_q.producer_get_barrier(pipeline_q_producer_state);
             copy(params.tma_load_q.with(*tma_barrier, 0),
-                 tQgQ(_, q1_index, get<2>(blk_coord)),
+                 tQgQ(_, q1_index),
                  tQsQ(_, pipeline_q_producer_state.index()));
         }
         ++pipeline_q_producer_state;
@@ -236,7 +282,7 @@ struct CollectiveMainloopFwdSm100 {
         if (lane_predicate) {
             auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
             copy(params.tma_load_v.with(*tma_barrier, 0),
-                 tVgV(_, k_index, get<2>(blk_coord)),
+                 tVgV(_, k_index),
                  tVsV(_, pipeline_kv_producer_state.index()));
         }
         ++pipeline_kv_producer_state;
@@ -250,7 +296,7 @@ struct CollectiveMainloopFwdSm100 {
             if (lane_predicate) {
                 auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
                 copy(params.tma_load_k.with(*tma_barrier, 0),
-                     tKgK(_, k_index, get<2>(blk_coord)),
+                     tKgK(_, k_index),
                      tKsK(_, pipeline_kv_producer_state.index()));
             }
             ++pipeline_kv_producer_state;
@@ -260,7 +306,7 @@ struct CollectiveMainloopFwdSm100 {
             if (lane_predicate) {
                 auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
                 copy(params.tma_load_v.with(*tma_barrier, 0),
-                     tVgV(_, k_index, get<2>(blk_coord)),
+                     tVgV(_, k_index),
                      tVsV(_, pipeline_kv_producer_state.index()));
             }
             ++pipeline_kv_producer_state;
@@ -329,8 +375,9 @@ struct CollectiveMainloopFwdSm100 {
         tOtO1.data() = tOtO.data().get() + static_cast<uint32_t>(TmemAlloc::O1);
 
         // P is stored in TMEM overlapping with S (after softmax)
-        Tensor sP = make_tensor(make_smem_ptr((Element*)nullptr), typename CollectiveMmaPV::SmemLayoutA{});
-        Tensor tOrP = thr_mma_pv.make_fragment_A(sP)(_, _, _, _0{});
+        // P fragment: M=128 x N=kBlockN (same shape as TileShapePV but for P input)
+        // For SM100 blockscaled MMA, P comes from TMEM not SMEM
+        Tensor tOrP = partition_fragment_A(mma_pv_ts, select<0,1>(TileShapePV{}));
 
         Tensor tOrP0 = tOrP;
         tOrP0.data() = tOrP0.data().get() + static_cast<uint32_t>(TmemAlloc::P0);
@@ -1008,9 +1055,9 @@ private:
         Tensor tOsO_i = logical_divide(tOsO, make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
 
         if constexpr (decltype(stage == _0{})::value) {
-            tOtO_i.data() = tOtO_i.data().get() + uint32_t(TmemAlloc::O0);
+            tOtO_i.data() = tOtO_i.data().get() + static_cast<uint32_t>(TmemAlloc::O0);
         } else {
-            tOtO_i.data() = tOtO_i.data().get() + uint32_t(TmemAlloc::O1);
+            tOtO_i.data() = tOtO_i.data().get() + static_cast<uint32_t>(TmemAlloc::O1);
         }
 
         auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tOtO_i(make_coord(_, _), _0{}));
