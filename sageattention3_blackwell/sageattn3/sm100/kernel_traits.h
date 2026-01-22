@@ -216,16 +216,23 @@ struct Flash_fwd_kernel_traits_sm100 {
     using SmemLayoutK = SmemLayoutKFull;
     using SmemLayoutV = SmemLayoutVFull;
 
-    // Output SMEM layout - 3D for epilogue double buffering (M, K, 2)
+    // Note: SmemLayoutO is defined in CollectiveEpilogueFwdSm100
+    // We forward-declare the epilogue layout here for SharedStorage
+    using EpilogueTileShape = Shape<
+        decltype(get<0>(TileShapeQK{})),  // M = 128
+        decltype(get<2>(TileShapeQK{})),  // K = HeadDim
+        _1                                 // batch dimension (tiled by 1)
+    >;
     using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
         cute::UMMA::Major::K, ElementOut,
-        decltype(cute::get<0>(TileShapeQK{})),
-        decltype(cute::get<2>(TileShapeQK{}))
+        decltype(get<0>(EpilogueTileShape{})),
+        decltype(get<1>(EpilogueTileShape{}))
     >());
     using SmemLayoutO = decltype(tile_to_shape(
         SmemLayoutAtomO{},
-        make_shape(get<0>(TileShapeQK{}), get<2>(TileShapeQK{}), _2{}),
-        Step<_2, _1, _3>{}));
+        replace<2>(EpilogueTileShape{}, _2{}),
+        Step<_2, _1, _3>{}
+    ));
 
     // Extract TMA descriptors from CollectiveBuilder
     using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;

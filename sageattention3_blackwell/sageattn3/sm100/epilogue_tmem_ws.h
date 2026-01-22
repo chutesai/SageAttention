@@ -33,16 +33,25 @@ using namespace cute;
 
 ///////////////////////////////////////////////////////////////////////////////
 // SM100 Collective Epilogue for Flash Attention Forward
+//
+// Following CUTLASS example 77 pattern exactly.
 ///////////////////////////////////////////////////////////////////////////////
 
 template <typename Ktraits>
 struct CollectiveEpilogueFwdSm100 {
 
     using ElementOut = typename Ktraits::ElementOut;
-    using TileShape = typename Ktraits::TileShape_MNK;
     using TileShapeQK = typename Ktraits::TileShapeQK;
-    using SmemLayoutO = typename Ktraits::SmemLayoutO;
     using PipelineE = typename Ktraits::PipelineE;
+    using SmemLayoutO = typename Ktraits::SmemLayoutO;
+
+    // TileShape for epilogue: (M, K, _) where M and K come from TileShapeQK
+    // This is a 3D shape like CUTLASS example 77 uses
+    using TileShape = Shape<
+        decltype(get<0>(TileShapeQK{})),  // M = 128
+        decltype(get<2>(TileShapeQK{})),  // K = HeadDim
+        _1                                 // batch dimension (tiled by 1)
+    >;
 
     // Stride for O in GMEM: (seq_stride, dim_stride=1, batch_head_stride)
     using StrideO = cute::Stride<int64_t, _1, int64_t>;
@@ -99,15 +108,16 @@ struct CollectiveEpilogueFwdSm100 {
 
     ///////////////////////////////////////////////////////////////////////////
     // Store function (executed by Epilogue warp)
+    // Following CUTLASS example 77 sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp
     ///////////////////////////////////////////////////////////////////////////
 
-    template <typename BlkCoord, typename ProblemShape, typename SharedStorage>
+    template <typename BlkCoord, typename ProblemShape, typename TensorStorage_>
     CUTLASS_DEVICE void store(
         BlkCoord const& blk_coord,
         ProblemShape const& problem_shape,
         Params const& params,
         Flash_fwd_params const& flash_params,
-        SharedStorage& storage,
+        TensorStorage_& shared_storage,
         PipelineE& pipeline,
         typename PipelineE::PipelineState& pipeline_consumer_state
     ) {
@@ -122,23 +132,19 @@ struct CollectiveEpilogueFwdSm100 {
         // Get TMA tensor for O - problem_shape_O = (seqlen_q, head_dim, batch*heads)
         Tensor mO = params.tma_store_o.get_tma_tensor(select<0, 2, 3>(problem_shape));
 
-        // TileShapeQK is 3D (M, N, K) = (128, 128, HeadDim)
-        // We need a 3D tile shape for O: (M, K, _) where _ is batch dimension
-        // Use select<0,2>(TileShapeQK) for M and K dims, append _1 for batch
-        using TileShapeO = Shape<
-            decltype(get<0>(TileShapeQK{})),  // M = 128
-            decltype(get<2>(TileShapeQK{})),  // K = HeadDim
-            _1                                 // batch = 1 (tiled)
-        >;
+        // local_tile with 3D TileShape on 3D tensor
+        // This creates: gO_qdl with shape (TileM, TileK, 1, num_tiles_m, num_batches)
+        Tensor gO_qdl = local_tile(mO, TileShape{}, make_coord(_, _, _), Step<_1, _1, X>{});
 
-        // local_tile with 3D tile shape on 3D tensor
-        Tensor gO_full = local_tile(mO, TileShapeO{}, make_coord(_, _, _), Step<_1, _1, X>{});
-
-        // Select the batch slice for this block
-        Tensor gO = gO_full(_, _, _, get<2>(blk_coord));
+        // Select: (TileM, TileK, 1, tile_idx, batch_idx) -> we want (TileM, TileK, 1, tile_idx)
+        // gO_qdl has 5 modes after local_tile with 3D tile on 3D tensor
+        // Mode 0-2: tile content (M, K, 1)
+        // Mode 3: M tiles
+        // Mode 4: batch tiles (we select with blk_coord)
+        Tensor gO = gO_qdl(_, _, _, _, get<2>(blk_coord));
 
         // Setup SMEM tensor for O - 3D layout (M, K, 2)
-        Tensor sO = make_tensor(make_smem_ptr(storage.smem_o.data()), SmemLayoutO{});
+        Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
 
         auto block_tma = params.tma_store_o.get_slice(0);
         Tensor tOsO = block_tma.partition_S(sO);
@@ -151,7 +157,7 @@ struct CollectiveEpilogueFwdSm100 {
         ++pipeline_consumer_state;
 
         if (lane_predicate) {
-            copy(params.tma_store_o, tOsO(_, _, _0{}), tOgO(_, _, o0_index));
+            copy(params.tma_store_o, tOsO(_, _, _, _0{}), tOgO(_, _, _, o0_index));
         }
         tma_store_arrive();
 
@@ -160,7 +166,7 @@ struct CollectiveEpilogueFwdSm100 {
         ++pipeline_consumer_state;
 
         if (lane_predicate) {
-            copy(params.tma_store_o, tOsO(_, _, _1{}), tOgO(_, _, o1_index));
+            copy(params.tma_store_o, tOsO(_, _, _, _1{}), tOgO(_, _, _, o1_index));
         }
         tma_store_arrive();
 
