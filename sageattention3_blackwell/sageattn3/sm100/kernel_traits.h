@@ -307,11 +307,19 @@ struct Flash_fwd_kernel_traits_sm100 {
     // SMEM Layouts (manual, using UMMA layouts directly)
     ///////////////////////////////////////////////////////////////////////////
 
-    // For FP4 data (K-major), use UMMA::Layout_K_SW128_Atom which properly handles sub-byte types
-    // The layout atom handles swizzling for TMA loads with the correct element size
-    using SmemLayoutAtomQ = UMMA::Layout_K_SW128_Atom<Element>;
-    using SmemLayoutAtomK = UMMA::Layout_K_SW128_Atom<Element>;
-    using SmemLayoutAtomV = UMMA::Layout_K_SW128_Atom<Element>;
+    // For FP4 data (K-major), select appropriate swizzle based on HeadDim
+    // Layout_K_SW128_Atom<4-bit> = (8, 256) elements, so HeadDim must be >= 256
+    // Layout_K_SW64_Atom<4-bit>  = (8, 128) elements, so HeadDim must be >= 128
+    // For HeadDim=128 with FP4, use SW64; for HeadDim=256, use SW128
+    using SmemLayoutAtomQ = cute::conditional_t<(kHeadDim >= 256),
+        UMMA::Layout_K_SW128_Atom<Element>,
+        UMMA::Layout_K_SW64_Atom<Element>>;
+    using SmemLayoutAtomK = cute::conditional_t<(kHeadDim >= 256),
+        UMMA::Layout_K_SW128_Atom<Element>,
+        UMMA::Layout_K_SW64_Atom<Element>>;
+    using SmemLayoutAtomV = cute::conditional_t<(kHeadDim >= 256),
+        UMMA::Layout_K_SW128_Atom<Element>,
+        UMMA::Layout_K_SW64_Atom<Element>>;
 
     // Q: single stage, 2 tiles (for ThreadShape=(2,1,1))
     using SmemLayoutQ = decltype(tile_to_shape(
