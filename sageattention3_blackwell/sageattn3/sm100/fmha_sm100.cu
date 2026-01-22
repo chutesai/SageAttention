@@ -84,9 +84,11 @@ struct FmhaKernel {
     using Operation = cutlass::fmha::device::FMHA<Kernel>;
 };
 
-// Define mask type aliases explicitly to avoid any name lookup issues
+// Define mask type aliases explicitly
+// CausalMask is a template in CUTLASS v4.3.5: template<bool kIsQBegin = true>
+// kIsQBegin=true means Q is at the beginning of the matrix (standard causal)
 using MaskNone = fmha_collective::NoMask;
-using MaskCausal = fmha_collective::CausalMask;
+using MaskCausal = fmha_collective::CausalMask<true>;  // Standard causal attention
 
 using FmhaNoMask = FmhaKernel<MaskNone>;
 using FmhaCausal = FmhaKernel<MaskCausal>;
