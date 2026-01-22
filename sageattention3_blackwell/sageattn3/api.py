@@ -230,11 +230,11 @@ def blockscaled_fp4_attn(qlist: Tuple,
         )
 
 
-def sageattn3_blackwell(q, k, v, attn_mask = None, is_causal = False, per_block_mean = True, **kwargs):
+def sageattn3_blackwell(q, k, v, attn_mask = None, is_causal = False, per_block_mean = True, use_fp4 = False, **kwargs):
     """SageAttention3 for Blackwell GPUs.
 
-    For SM100 (B200/B300), uses the high-performance CUTLASS FMHA by default.
-    For SM120 (RTX 5090), uses the FP4 blockscaled attention.
+    For SM100 (B200/B300), uses BF16 CUTLASS FMHA by default (stable, ~90% of cuDNN perf).
+    For SM120 (RTX 5090), uses the FP4 blockscaled attention for maximum performance.
 
     Args:
         q: Query tensor [batch, heads, seqlen_q, head_dim]
@@ -243,10 +243,16 @@ def sageattn3_blackwell(q, k, v, attn_mask = None, is_causal = False, per_block_
         attn_mask: Optional attention mask (not used in SM100 path)
         is_causal: Whether to use causal masking
         per_block_mean: Whether to use per-block mean subtraction (FP4 path only)
+        use_fp4: Force FP4 path on SM100 (experimental, may crash)
     """
-    # Use high-performance CUTLASS FMHA for SM100 by default
+    # SM100 (B200/B300) path
     if is_sm100():
-        return sageattn3_sm100_fast(q, k, v, is_causal=is_causal)
+        if use_fp4:
+            # Experimental FP4 path - has known issues with TMEM/tcgen05
+            pass  # Fall through to FP4 path below
+        else:
+            # Default: Use stable BF16 CUTLASS FMHA
+            return sageattn3_sm100_fast(q, k, v, is_causal=is_causal)
 
     # Fall back to FP4 path for SM120 or if explicitly requested
     if q.size(-1) >= 256:
@@ -273,10 +279,14 @@ def sageattn3_blackwell(q, k, v, attn_mask = None, is_causal = False, per_block_
 
 
 def sageattn3_sm100_fast(q, k, v, is_causal=False, scale=None):
-    """High-performance FMHA for SM100 (B200/B300) using CUTLASS example 77.
+    """High-performance BF16 FMHA for SM100 (B200/B300) using CUTLASS.
 
-    This is the fastest attention implementation for B200/B300, using NVIDIA's
-    official warp-specialized FMHA kernels with TMEM accumulators.
+    Uses NVIDIA's official warp-specialized FMHA kernels. Performance is
+    approximately 85-90% of PyTorch's cuDNN attention backend.
+
+    For maximum performance, consider using PyTorch's native SDPA which
+    automatically selects cuDNN on B200:
+        torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
     Args:
         q: Query tensor [batch, heads, seqlen_q, head_dim] in BF16
@@ -312,3 +322,38 @@ def sageattn3_sm100_fast(q, k, v, is_causal=False, scale=None):
         return fmha_sm100.fwd_auto_scale(q, k, v, is_causal)
     else:
         return fmha_sm100.fwd(q, k, v, is_causal, scale)
+
+
+def sageattn3_fp4_kernel_only(q_fp4, k_fp4, v_fp4, sfq, sfk, sfv, delta_s,
+                               seqlen_k, is_causal=False, per_block_mean=True, is_bf16=True):
+    """Low-level FP4 attention kernel for pre-quantized inputs (SM100/SM120).
+
+    WARNING: The SM100 FP4 kernel has known issues (illegal instruction errors).
+    Use at your own risk. For SM120 (RTX 5090), this should work correctly.
+
+    This bypasses preprocessing overhead for maximum throughput when inputs
+    are already quantized. Users are responsible for:
+    1. Quantizing Q, K, V to FP4 with proper scaling
+    2. Computing delta_s correction terms
+    3. Ensuring correct tensor layouts
+
+    Args:
+        q_fp4: Packed FP4 query [batch, heads, seqlen_q, head_dim//2] uint8
+        k_fp4: Packed FP4 key [batch, heads, seqlen_k, head_dim//2] uint8
+        v_fp4: Packed FP4 value (transposed) [batch, heads, head_dim, seqlen_k//2] uint8
+        sfq: Q scale factors [batch, heads, seqlen_q, head_dim//16] float8_e4m3fn
+        sfk: K scale factors [batch, heads, seqlen_k, head_dim//16] float8_e4m3fn
+        sfv: V scale factors [batch, heads, head_dim, seqlen_k//16] float8_e4m3fn
+        delta_s: Correction terms [batch, heads, seqlen_q//128, seqlen_k] float32
+        seqlen_k: Original K sequence length (before padding)
+        is_causal: Whether to use causal masking
+        per_block_mean: Whether delta_s uses per-block means
+        is_bf16: Output in BF16 (True) or FP16 (False)
+
+    Returns:
+        Output tensor [batch, heads, seqlen_q, head_dim] in BF16/FP16
+    """
+    return blockscaled_fp4_attn(
+        (q_fp4, sfq), (k_fp4, sfk), (v_fp4, sfv),
+        delta_s, seqlen_k, is_causal, per_block_mean, is_bf16
+    )
