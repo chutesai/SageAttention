@@ -13,25 +13,460 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * SM100 (B200/B300) Warp-Specialized Attention Kernel
+ * SM100 (B200/B300) Warp-Specialized Flash Attention Kernel
  *
- * For now, this directly uses the SM120 kernel implementation.
- * The kernel code is architecture-agnostic and relies on CUTLASS
- * to emit the correct instructions for SM100 vs SM120.
+ * This implements the warp-specialized execution model for SM100:
+ *   - 16 warps with specialized roles
+ *   - TMEM accumulators for S and O matrices
+ *   - Pipelined execution between warp groups
  */
 
 #pragma once
 
-// Include the SM120 kernel directly
-#include "../blackwell/kernel_ws.h"
+#include "cute/tensor.hpp"
+#include "cutlass/cutlass.h"
+#include "cutlass/kernel_hardware_info.h"
+#include "cutlass/pipeline/pipeline.hpp"
+#include "cute/arch/tmem_allocator_sm100.hpp"
+
 #include "kernel_traits.h"
 #include "mainloop_tmem_ws.h"
 #include "epilogue_tmem_ws.h"
+#include "../blackwell/params.h"
+#include "../blackwell/tile_scheduler.h"
 
 namespace flash {
 
-// For SM100, we use the same kernel as SM120
-// The hardware differences are handled by CUTLASS internally
+using namespace cute;
+
+///////////////////////////////////////////////////////////////////////////////
+// SM100 Flash Attention Forward Kernel (Warp-Specialized)
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename Ktraits, bool Is_causal, typename TileScheduler>
+struct Sm100FlashFwdKernel {
+
+    using Element = typename Ktraits::Element;
+    using ElementOut = typename Ktraits::ElementOut;
+    using ElementAccum = typename Ktraits::ElementAccum;
+    using TileShape = typename Ktraits::TileShape_MNK;
+    using Schedule = typename Ktraits::Schedule;
+    using WarpRole = typename Schedule::WarpRole;
+
+    using CollectiveMainloop = CollectiveMainloopFwdSm100<Ktraits, Is_causal>;
+    using CollectiveEpilogue = CollectiveEpilogueFwdSm100<Ktraits>;
+
+    using SharedStorage = typename Ktraits::SharedStorage;
+    using TmemAllocator = typename Ktraits::TmemAllocator;
+
+    // Pipeline types
+    using PipelineQ = typename Ktraits::PipelineQ;
+    using PipelineKV = typename Ktraits::PipelineKV;
+    using PipelineS = typename Ktraits::PipelineS;
+    using PipelineC = typename Ktraits::PipelineC;
+    using PipelineO = typename Ktraits::PipelineO;
+    using PipelineE = typename Ktraits::PipelineE;
+    using OrderBarrierSoftmax = typename Ktraits::OrderBarrierSoftmax;
+
+    static constexpr int kNWarps = Schedule::kNumWarps;
+    static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
+
+    ///////////////////////////////////////////////////////////////////////////
+    // Kernel entry point
+    ///////////////////////////////////////////////////////////////////////////
+
+    CUTLASS_DEVICE void operator()(
+        Flash_fwd_params const& params,
+        typename CollectiveMainloop::Params const& mainloop_params,
+        typename CollectiveEpilogue::Params const& epilogue_params,
+        typename TileScheduler::Params const& scheduler_params,
+        char* smem
+    ) {
+        TileScheduler tile_scheduler{scheduler_params};
+
+        int warp_idx = cutlass::canonical_warp_idx_sync();
+        auto role = Schedule::warp_idx_to_role(warp_idx);
+        uint32_t lane_predicate = cute::elect_one_sync();
+
+        SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem);
+
+        // Prefetch TMA descriptors
+        if (role == WarpRole::Load && lane_predicate) {
+            CollectiveMainloop::prefetch_tma_descriptors(mainloop_params);
+        }
+        if (role == WarpRole::Epilogue && lane_predicate) {
+            CollectiveEpilogue::prefetch_tma_descriptors(epilogue_params);
+        }
+
+        // Initialize pipelines
+        auto [pipeline_q, pipeline_kv, pipeline_s0, pipeline_s1,
+              pipeline_c0, pipeline_c1, pipeline_o, pipeline_epi,
+              order_s01] = init_pipelines(role, lane_predicate, shared_storage);
+
+        // Initialize TMEM allocator
+        TmemAllocator tmem_allocator;
+
+        __syncthreads();
+
+        // Initialize pipeline masks (only for UMMA-based pipelines)
+        pipeline_q.init_masks(typename Ktraits::ClusterShape_MNK{});
+        pipeline_kv.init_masks(typename Ktraits::ClusterShape_MNK{});
+        pipeline_s0.init_masks(typename Ktraits::ClusterShape_MNK{});
+        pipeline_s1.init_masks(typename Ktraits::ClusterShape_MNK{});
+        pipeline_o.init_masks(typename Ktraits::ClusterShape_MNK{});
+        // Note: PipelineC (pipeline_c0, pipeline_c1) and PipelineE (pipeline_epi)
+        // are PipelineAsync which don't have init_masks
+
+        // Initialize pipeline states
+        typename PipelineQ::PipelineState pipeline_q_consumer_state;
+        typename PipelineQ::PipelineState pipeline_q_producer_state =
+            cutlass::make_producer_start_state<PipelineQ>();
+
+        typename PipelineKV::PipelineState pipeline_kv_consumer_state;
+        typename PipelineKV::PipelineState pipeline_kv_producer_state =
+            cutlass::make_producer_start_state<PipelineKV>();
+
+        typename PipelineS::PipelineState pipeline_s0_consumer_state;
+        typename PipelineS::PipelineState pipeline_s0_producer_state =
+            cutlass::make_producer_start_state<PipelineS>();
+
+        typename PipelineS::PipelineState pipeline_s1_consumer_state;
+        typename PipelineS::PipelineState pipeline_s1_producer_state =
+            cutlass::make_producer_start_state<PipelineS>();
+
+        typename PipelineC::PipelineState pipeline_c0_consumer_state;
+        typename PipelineC::PipelineState pipeline_c0_producer_state =
+            cutlass::make_producer_start_state<PipelineC>();
+
+        typename PipelineC::PipelineState pipeline_c1_consumer_state;
+        typename PipelineC::PipelineState pipeline_c1_producer_state =
+            cutlass::make_producer_start_state<PipelineC>();
+
+        typename PipelineO::PipelineState pipeline_o_consumer_state;
+        typename PipelineO::PipelineState pipeline_o_producer_state =
+            cutlass::make_producer_start_state<PipelineO>();
+
+        typename PipelineE::PipelineState pipeline_epi_consumer_state;
+        typename PipelineE::PipelineState pipeline_epi_producer_state =
+            cutlass::make_producer_start_state<PipelineE>();
+
+        CollectiveMainloop mainloop;
+        CollectiveEpilogue epilogue;
+
+        // Dispatch based on warp role
+        if (role == WarpRole::Softmax0 || role == WarpRole::Softmax1) {
+            // Softmax warps: compute online softmax on S matrices
+            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsSoftmax>();
+
+            CUTLASS_PRAGMA_NO_UNROLL
+            for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+                auto blk_coord = tile_scheduler.get_block_coord();
+                auto problem_shape = get_problem_shape(params, blk_coord);
+
+                if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(problem_shape)) {
+                    continue;
+                }
+
+                bool is_softmax_0 = (role == WarpRole::Softmax0);
+
+                mainloop.softmax(
+                    is_softmax_0 ? 0 : 1, blk_coord,
+                    mainloop_params, problem_shape, params,
+                    is_softmax_0 ? pipeline_s0 : pipeline_s1,
+                    is_softmax_0 ? pipeline_s0_consumer_state : pipeline_s1_consumer_state,
+                    is_softmax_0 ? pipeline_c0 : pipeline_c1,
+                    is_softmax_0 ? pipeline_c0_producer_state : pipeline_c1_producer_state,
+                    order_s01
+                );
+            }
+        }
+        else if (role == WarpRole::Correction) {
+            // Correction warps: rescale O accumulators based on new row maxes
+            cutlass::arch::warpgroup_reg_dealloc<Schedule::kNumRegsCorrection>();
+
+            CUTLASS_PRAGMA_NO_UNROLL
+            for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+                auto blk_coord = tile_scheduler.get_block_coord();
+                auto problem_shape = get_problem_shape(params, blk_coord);
+
+                if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(problem_shape)) {
+                    continue;
+                }
+
+                mainloop.correction(
+                    blk_coord,
+                    mainloop_params, problem_shape, params,
+                    shared_storage,
+                    pipeline_c0, pipeline_c0_consumer_state,
+                    pipeline_c1, pipeline_c1_consumer_state,
+                    pipeline_o, pipeline_o_consumer_state,
+                    pipeline_epi, pipeline_epi_producer_state
+                );
+            }
+
+            // Free TMEM if epilogue is done in correction warp
+            if constexpr (Schedule::kNumWarpsEpilogue == 0) {
+                uint32_t free_ptr = shared_storage.tmem_base_ptr;
+                tmem_allocator.free(free_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+            }
+        }
+        else if (role == WarpRole::MMA) {
+            // MMA warp: compute QK^T and PV matrix products
+            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
+
+            // Allocate TMEM
+            tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns,
+                                    &shared_storage.tmem_base_ptr);
+            __syncwarp();
+
+            CUTLASS_PRAGMA_NO_UNROLL
+            for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+                auto blk_coord = tile_scheduler.get_block_coord();
+                auto problem_shape = get_problem_shape(params, blk_coord);
+
+                if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(problem_shape)) {
+                    continue;
+                }
+
+                mainloop.mma(
+                    blk_coord,
+                    mainloop_params, problem_shape, params,
+                    shared_storage,
+                    pipeline_q, pipeline_q_consumer_state,
+                    pipeline_kv, pipeline_kv_consumer_state,
+                    pipeline_s0, pipeline_s0_producer_state,
+                    pipeline_s1, pipeline_s1_producer_state,
+                    pipeline_o, pipeline_o_producer_state
+                );
+            }
+        }
+        else if (role == WarpRole::Load) {
+            // Load warp: issue TMA loads for Q, K, V
+            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
+
+            CUTLASS_PRAGMA_NO_UNROLL
+            for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+                auto blk_coord = tile_scheduler.get_block_coord();
+                auto problem_shape = get_problem_shape(params, blk_coord);
+
+                if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(problem_shape)) {
+                    continue;
+                }
+
+                mainloop.load(
+                    blk_coord, problem_shape,
+                    mainloop_params, params,
+                    shared_storage,
+                    pipeline_q, pipeline_q_producer_state,
+                    pipeline_kv, pipeline_kv_producer_state
+                );
+            }
+        }
+        else if (role == WarpRole::Epilogue) {
+            // Epilogue warp: TMA store output O
+            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsOther>();
+
+            CUTLASS_PRAGMA_NO_UNROLL
+            for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+                auto blk_coord = tile_scheduler.get_block_coord();
+                auto problem_shape = get_problem_shape(params, blk_coord);
+
+                if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(problem_shape)) {
+                    continue;
+                }
+
+                epilogue.store(
+                    blk_coord, problem_shape,
+                    epilogue_params, params,
+                    shared_storage,
+                    pipeline_epi, pipeline_epi_consumer_state
+                );
+            }
+
+            // Free TMEM
+            if constexpr (Schedule::kNumWarpsEpilogue == 1) {
+                uint32_t free_ptr = shared_storage.tmem_base_ptr;
+                tmem_allocator.free(free_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+            }
+        }
+        else if (role == WarpRole::Empty) {
+            // Empty warp: donate registers and exit
+            cutlass::arch::warpgroup_reg_alloc<Schedule::kNumRegsEmpty>();
+        }
+    }
+
+private:
+    ///////////////////////////////////////////////////////////////////////////
+    // Pipeline initialization
+    ///////////////////////////////////////////////////////////////////////////
+
+    CUTLASS_DEVICE auto init_pipelines(
+        WarpRole role,
+        uint32_t lane_predicate,
+        SharedStorage& shared_storage
+    ) {
+        using ClusterShape = typename Ktraits::ClusterShape_MNK;
+
+        // Pipeline Q: Load -> MMA
+        typename PipelineQ::Params pipeline_q_params;
+        if (role == WarpRole::Load) {
+            pipeline_q_params.role = PipelineQ::ThreadCategory::Producer;
+        }
+        if (role == WarpRole::MMA) {
+            pipeline_q_params.role = PipelineQ::ThreadCategory::Consumer;
+        }
+        pipeline_q_params.is_leader = lane_predicate && (role == WarpRole::Load);
+        pipeline_q_params.transaction_bytes = Ktraits::TransactionBytesQ;
+        PipelineQ pipeline_q(
+            shared_storage.pipelines.pipeline_q,
+            pipeline_q_params, ClusterShape{},
+            cute::true_type{}, cute::false_type{});
+
+        // Pipeline KV: Load -> MMA
+        typename PipelineKV::Params pipeline_kv_params;
+        if (role == WarpRole::Load) {
+            pipeline_kv_params.role = PipelineKV::ThreadCategory::Producer;
+        }
+        if (role == WarpRole::MMA) {
+            pipeline_kv_params.role = PipelineKV::ThreadCategory::Consumer;
+        }
+        pipeline_kv_params.is_leader = lane_predicate && (role == WarpRole::Load);
+        pipeline_kv_params.transaction_bytes = Ktraits::TransactionBytesKV;
+        PipelineKV pipeline_kv(
+            shared_storage.pipelines.pipeline_kv,
+            pipeline_kv_params, ClusterShape{},
+            cute::true_type{}, cute::false_type{});
+
+        // Pipeline S0: MMA -> Softmax0
+        typename PipelineS::Params pipeline_s0_params;
+        if (role == WarpRole::MMA) {
+            pipeline_s0_params.role = PipelineS::ThreadCategory::Producer;
+        }
+        if (role == WarpRole::Softmax0) {
+            pipeline_s0_params.role = PipelineS::ThreadCategory::Consumer;
+        }
+        pipeline_s0_params.consumer_arv_count =
+            Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
+        PipelineS pipeline_s0(
+            shared_storage.pipelines.pipeline_s0,
+            pipeline_s0_params, ClusterShape{},
+            cute::true_type{}, cute::false_type{});
+
+        // Pipeline S1: MMA -> Softmax1
+        typename PipelineS::Params pipeline_s1_params;
+        if (role == WarpRole::MMA) {
+            pipeline_s1_params.role = PipelineS::ThreadCategory::Producer;
+        }
+        if (role == WarpRole::Softmax1) {
+            pipeline_s1_params.role = PipelineS::ThreadCategory::Consumer;
+        }
+        pipeline_s1_params.consumer_arv_count =
+            Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
+        PipelineS pipeline_s1(
+            shared_storage.pipelines.pipeline_s1,
+            pipeline_s1_params, ClusterShape{},
+            cute::true_type{}, cute::false_type{});
+
+        // Pipeline C0: Softmax0 -> Correction
+        typename PipelineC::Params pipeline_c0_params;
+        if (role == WarpRole::Softmax0) {
+            pipeline_c0_params.role = PipelineC::ThreadCategory::Producer;
+        }
+        if (role == WarpRole::Correction) {
+            pipeline_c0_params.role = PipelineC::ThreadCategory::Consumer;
+        }
+        pipeline_c0_params.producer_arv_count =
+            Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
+        pipeline_c0_params.consumer_arv_count =
+            Schedule::kNumWarpsCorrection * cutlass::NumThreadsPerWarp;
+        PipelineC pipeline_c0(
+            shared_storage.pipelines.pipeline_c0,
+            pipeline_c0_params, cute::true_type{});
+
+        // Pipeline C1: Softmax1 -> Correction
+        typename PipelineC::Params pipeline_c1_params;
+        if (role == WarpRole::Softmax1) {
+            pipeline_c1_params.role = PipelineC::ThreadCategory::Producer;
+        }
+        if (role == WarpRole::Correction) {
+            pipeline_c1_params.role = PipelineC::ThreadCategory::Consumer;
+        }
+        pipeline_c1_params.producer_arv_count =
+            Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
+        pipeline_c1_params.consumer_arv_count =
+            Schedule::kNumWarpsCorrection * cutlass::NumThreadsPerWarp;
+        PipelineC pipeline_c1(
+            shared_storage.pipelines.pipeline_c1,
+            pipeline_c1_params, cute::true_type{});
+
+        // Pipeline O: MMA -> Correction
+        typename PipelineO::Params pipeline_o_params;
+        if (role == WarpRole::MMA) {
+            pipeline_o_params.role = PipelineO::ThreadCategory::Producer;
+        }
+        if (role == WarpRole::Correction) {
+            pipeline_o_params.role = PipelineO::ThreadCategory::Consumer;
+        }
+        pipeline_o_params.consumer_arv_count =
+            Schedule::kNumWarpsCorrection * cutlass::NumThreadsPerWarp;
+        PipelineO pipeline_o(
+            shared_storage.pipelines.pipeline_o,
+            pipeline_o_params, ClusterShape{},
+            cute::true_type{}, cute::false_type{});
+
+        // Pipeline Epi: Correction -> Epilogue
+        typename PipelineE::Params pipeline_epi_params;
+        if (role == WarpRole::Correction) {
+            pipeline_epi_params.role = PipelineE::ThreadCategory::Producer;
+        }
+        if (role == WarpRole::Epilogue) {
+            pipeline_epi_params.role = PipelineE::ThreadCategory::Consumer;
+        }
+        pipeline_epi_params.producer_arv_count =
+            Schedule::kNumWarpsCorrection * cutlass::NumThreadsPerWarp;
+        pipeline_epi_params.consumer_arv_count =
+            Schedule::kNumWarpsEpilogue * cutlass::NumThreadsPerWarp;
+        PipelineE pipeline_epi(
+            shared_storage.pipelines.pipeline_epi,
+            pipeline_epi_params, cute::true_type{});
+
+        // Ordered barrier for softmax warps
+        typename OrderBarrierSoftmax::Params order_s01_params;
+        order_s01_params.group_id = (role == WarpRole::Softmax1) ? 1 : 0;
+        order_s01_params.group_size =
+            Schedule::kNumWarpsSoftmax * cutlass::NumThreadsPerWarp;
+        OrderBarrierSoftmax order_s01(
+            shared_storage.pipelines.order_s01, order_s01_params);
+
+        return cute::make_tuple(
+            pipeline_q, pipeline_kv, pipeline_s0, pipeline_s1,
+            pipeline_c0, pipeline_c1, pipeline_o, pipeline_epi,
+            order_s01);
+    }
+
+    ///////////////////////////////////////////////////////////////////////////
+    // Get problem shape from params
+    ///////////////////////////////////////////////////////////////////////////
+
+    template <typename BlkCoord>
+    CUTLASS_DEVICE auto get_problem_shape(
+        Flash_fwd_params const& params,
+        BlkCoord const& blk_coord
+    ) {
+        // Problem shape: (seqlen_q, seqlen_k, head_dim, batch*heads)
+        return make_shape(
+            params.seqlen_q,
+            params.seqlen_k,
+            params.d,
+            params.b * params.h
+        );
+    }
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Kernel launch wrapper
+///////////////////////////////////////////////////////////////////////////////
+
 template <typename Ktraits, bool Is_causal, typename TileScheduler>
 __global__ void __launch_bounds__(Ktraits::kNThreads, 1)
 compute_attn_ws_sm100(
@@ -40,10 +475,10 @@ compute_attn_ws_sm100(
     CUTE_GRID_CONSTANT typename CollectiveEpilogueFwdSm100<Ktraits>::Params const epilogue_params,
     CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params
 ) {
-    // Forward to the SM120 kernel implementation
-    // The kernel code is architecture-agnostic
-    compute_attn_ws<Ktraits, Is_causal, TileScheduler>(
-        params, mainloop_params, epilogue_params, scheduler_params);
+    extern __shared__ char smem[];
+
+    Sm100FlashFwdKernel<Ktraits, Is_causal, TileScheduler> kernel;
+    kernel(params, mainloop_params, epilogue_params, scheduler_params, smem);
 }
 
 } // namespace flash
