@@ -20,9 +20,28 @@ except ImportError:
 
 
 def reference_attention(q, k, v, is_causal=False):
-    """Reference implementation using PyTorch SDPA."""
-    # SDPA expects (batch, heads, seq, dim)
-    return F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+    """Reference implementation using manual attention computation.
+
+    Avoids cuBLAS strided batched GEMM which has issues on B200.
+    """
+    # Manual attention: softmax(QK^T / sqrt(d)) @ V
+    scale = q.size(-1) ** -0.5
+
+    # Use einsum to avoid cuBLAS batched GEMM issues on B200
+    # QK^T: (batch, heads, seq_q, dim) @ (batch, heads, dim, seq_k) -> (batch, heads, seq_q, seq_k)
+    attn_weights = torch.einsum('bhqd,bhkd->bhqk', q.float(), k.float()) * scale
+
+    if is_causal:
+        seq_q, seq_k = attn_weights.size(-2), attn_weights.size(-1)
+        causal_mask = torch.triu(torch.ones(seq_q, seq_k, device=q.device, dtype=torch.bool), diagonal=1)
+        attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
+
+    attn_weights = F.softmax(attn_weights, dim=-1)
+
+    # Attn @ V: (batch, heads, seq_q, seq_k) @ (batch, heads, seq_k, dim) -> (batch, heads, seq_q, dim)
+    output = torch.einsum('bhqk,bhkd->bhqd', attn_weights, v.float())
+
+    return output.to(q.dtype)
 
 
 def compute_error_metrics(output, reference):
