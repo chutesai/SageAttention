@@ -40,6 +40,9 @@
 #include "cute/arch/mma_sm100_umma.hpp"
 #include "cute/atom/mma_traits_sm100.hpp"
 
+// Include SM100 common utilities for smem selector
+#include "cutlass/gemm/collective/builders/sm100_common.inl"
+
 #include "../blackwell/blockscaled_layout.h"
 #include "../blackwell/named_barrier.h"
 
@@ -225,15 +228,16 @@ struct Flash_fwd_kernel_traits_sm100 {
     // Use SM100 SMEM selectors for optimal memory access patterns
     ///////////////////////////////////////////////////////////////////////////
 
-    // Use SM100 smem selector (falls back to SM90 patterns which work for SM100)
-    using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::sm90_smem_selector<
-        GMMA::Major::K, Element, Int<kBlockM>, Int<kHeadDim>>());
-    using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::sm90_smem_selector<
-        GMMA::Major::K, Element, Int<kBlockN>, Int<kHeadDim>>());
-    using SmemLayoutAtomV = decltype(cutlass::gemm::collective::detail::sm90_smem_selector<
-        GMMA::Major::K, Element, Int<kBlockN>, Int<kHeadDim>>());
-    using SmemLayoutAtomVt = decltype(cutlass::gemm::collective::detail::sm90_smem_selector<
-        GMMA::Major::K, Element, Int<kHeadDim>, Int<kBlockN>>());
+    // Use SM100 smem selector for optimal TMEM access patterns
+    // Note: SM100 uses UMMA::Major (not GMMA::Major)
+    using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
+        UMMA::Major::K, Element, Int<kBlockM>, Int<kHeadDim>>());
+    using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
+        UMMA::Major::K, Element, Int<kBlockN>, Int<kHeadDim>>());
+    using SmemLayoutAtomV = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
+        UMMA::Major::K, Element, Int<kBlockN>, Int<kHeadDim>>());
+    using SmemLayoutAtomVt = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
+        UMMA::Major::K, Element, Int<kHeadDim>, Int<kBlockN>>());
 
     using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQ{}, select<0, 2>(TileShape_MNK{})));
     using SmemLayoutK = decltype(tile_to_shape(SmemLayoutAtomK{},

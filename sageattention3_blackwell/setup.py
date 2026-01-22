@@ -128,7 +128,7 @@ if not SKIP_CUDA_BUILD:
                 extra_compile_args={
                     "cxx": ["-O3", "-std=c++17"],
                     "nvcc": append_nvcc_threads(
-                        nvcc_flags + ["-DEXECMODE=0", "-DSM100"] + cc_flag
+                        nvcc_flags + ["-DEXECMODE=0"] + cc_flag
                     ),
                 },
                 include_dirs=include_dirs,
