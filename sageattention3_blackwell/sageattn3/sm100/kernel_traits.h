@@ -376,24 +376,35 @@ struct Flash_fwd_kernel_traits_sm100 {
     // TMA descriptors
     ///////////////////////////////////////////////////////////////////////////
 
+    // Single-stage tiled SMEM layouts for TMA (just the tile, no staging dimension)
+    using SmemLayoutQTma = decltype(tile_to_shape(
+        SmemLayoutAtomQ{},
+        select<0, 2>(TileShapeQK{})));
+    using SmemLayoutKTma = decltype(tile_to_shape(
+        SmemLayoutAtomK{},
+        select<1, 2>(TileShapeQK{})));
+    using SmemLayoutVTma = decltype(tile_to_shape(
+        SmemLayoutAtomV{},
+        select<1, 2>(TileShapePV{})));
+
     using TMA_Q = decltype(make_tma_copy(
         SM90_TMA_LOAD{},
         make_tensor(static_cast<Element const*>(nullptr), make_shape(1, 1, 1), StrideQ{}),
-        SmemLayoutAtomQ{},
+        SmemLayoutQTma{},
         select<0, 2>(TileShapeQK{}),
         _1{}));
 
     using TMA_K = decltype(make_tma_copy(
         SM90_TMA_LOAD{},
         make_tensor(static_cast<Element const*>(nullptr), make_shape(1, 1, 1), StrideK{}),
-        SmemLayoutAtomK{},
+        SmemLayoutKTma{},
         select<1, 2>(TileShapeQK{}),
         _1{}));
 
     using TMA_V = decltype(make_tma_copy(
         SM90_TMA_LOAD{},
         make_tensor(static_cast<Element const*>(nullptr), make_shape(1, 1, 1), StrideV{}),
-        SmemLayoutAtomV{},
+        SmemLayoutVTma{},
         select<1, 2>(TileShapePV{}),
         _1{}));
 

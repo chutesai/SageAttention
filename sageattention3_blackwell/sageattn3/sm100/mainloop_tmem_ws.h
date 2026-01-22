@@ -146,25 +146,25 @@ struct CollectiveMainloopFwdSm100 {
             make_shape(head_dim_packed, seqlen_k, batch_heads),
             make_stride(_1{}, head_dim_packed, seqlen_k * head_dim_packed));
 
-        // Create TMA descriptors
+        // Create TMA descriptors using tiled SMEM layouts
         auto tma_load_q = make_tma_copy(
             SM90_TMA_LOAD{},
             tensor_Q,
-            typename Ktraits::SmemLayoutAtomQ{},
+            typename Ktraits::SmemLayoutQTma{},
             select<0, 2>(TileShapeQK{}),
             _1{});
 
         auto tma_load_k = make_tma_copy(
             SM90_TMA_LOAD{},
             tensor_K,
-            typename Ktraits::SmemLayoutAtomK{},
+            typename Ktraits::SmemLayoutKTma{},
             select<1, 2>(TileShapeQK{}),
             _1{});
 
         auto tma_load_v = make_tma_copy(
             SM90_TMA_LOAD{},
             tensor_V,
-            typename Ktraits::SmemLayoutAtomV{},
+            typename Ktraits::SmemLayoutVTma{},
             select<1, 2>(TileShapePV{}),
             _1{});
 
