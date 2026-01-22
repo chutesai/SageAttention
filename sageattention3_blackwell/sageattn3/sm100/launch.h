@@ -84,22 +84,14 @@ void run_flash_fwd_sm100(Flash_fwd_params& params, cudaStream_t stream) {
 
     // Setup tile scheduler
     int num_m_blocks = cute::ceil_div(params.seqlen_q, get<0>(TileShape{}));
-    int num_batch_heads = params.b * params.h;
 
     typename TileScheduler::Arguments scheduler_args{
         num_m_blocks,
         params.h,
-        params.b,
-        1  // num_splits
+        params.b
     };
 
-    cutlass::KernelHardwareInfo hw_info;
-    hw_info.device_id = 0;
-    cudaGetDevice(&hw_info.device_id);
-    hw_info.sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-
-    auto scheduler_params = TileScheduler::to_underlying_arguments(
-        problem_shape, hw_info, typename Ktraits::ClusterShape_MNK{}, TileShape{});
+    auto scheduler_params = TileScheduler::to_underlying_arguments(scheduler_args);
 
     // Calculate shared memory size
     int smem_size = sizeof(typename Ktraits::SharedStorage);

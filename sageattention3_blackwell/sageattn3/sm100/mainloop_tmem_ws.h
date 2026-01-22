@@ -31,6 +31,7 @@
 #include "cute/arch/simd_sm100.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_conversion.h"
+#include "cutlass/array.h"
 #include "cutlass/arch/reg_reconfig.h"
 
 #include "kernel_traits.h"
@@ -849,9 +850,9 @@ private:
         Tensor tTMEM_STORErS_x4 = make_tensor<uint32_t>(shape(tTMEM_STOREcS));
 
         constexpr int kConversionsPerStep = 2;
-        Tensor tTMEM_STORErS_x4_e = recast<Array<Element, kConversionsPerStep>>(tTMEM_STORErS_x4);
+        Tensor tTMEM_STORErS_x4_e = recast<cutlass::Array<Element, kConversionsPerStep>>(tTMEM_STORErS_x4);
 
-        NumericArrayConverter<Element, ElementAccum, kConversionsPerStep> convert;
+        cutlass::NumericArrayConverter<Element, ElementAccum, kConversionsPerStep> convert;
 
         order_s.wait();
 
@@ -863,7 +864,7 @@ private:
             tTMEM_LOADrS(i) = ::exp2f(out.x);
             tTMEM_LOADrS(i+1) = ::exp2f(out.y);
 
-            Array<ElementAccum, kConversionsPerStep> in_conv;
+            cutlass::Array<ElementAccum, kConversionsPerStep> in_conv;
             in_conv[0] = tTMEM_LOADrS(i);
             in_conv[1] = tTMEM_LOADrS(i+1);
             tTMEM_STORErS_x4_e[i / kConversionsPerStep] = convert(in_conv);
@@ -1040,7 +1041,7 @@ private:
             }
 
             constexpr int N = 4 / sizeof(ElementOut);
-            NumericArrayConverter<ElementOut, ElementAccum, N> convert;
+            cutlass::NumericArrayConverter<ElementOut, ElementAccum, N> convert;
 
             Tensor tSMrO = make_tensor_like<ElementOut>(tTMrO);
             Tensor tCs = recast<typename decltype(convert)::source_type>(tTMrO);
