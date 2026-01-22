@@ -84,9 +84,12 @@ struct FmhaKernel {
     using Operation = cutlass::fmha::device::FMHA<Kernel>;
 };
 
-using FmhaNoMask = FmhaKernel<fmha_collective::NoMask>;
-// Temporarily commenting out causal to debug compilation
-// using FmhaCausal = FmhaKernel<fmha_collective::CausalMask>;
+// Define mask type aliases explicitly to avoid any name lookup issues
+using MaskNone = fmha_collective::NoMask;
+using MaskCausal = fmha_collective::CausalMask;
+
+using FmhaNoMask = FmhaKernel<MaskNone>;
+using FmhaCausal = FmhaKernel<MaskCausal>;
 
 ///////////////////////////////////////////////////////////////////////////////
 // Kernel Launch Function
@@ -229,8 +232,7 @@ torch::Tensor fmha_fwd_sm100(
     at::cuda::CUDAGuard device_guard(q.device());
 
     if (is_causal) {
-        // TODO: Add causal support once base kernel compiles
-        TORCH_CHECK(false, "Causal attention not yet implemented for SM100");
+        return run_fmha_impl<FmhaCausal>(q, k, v, scale);
     }
     return run_fmha_impl<FmhaNoMask>(q, k, v, scale);
 }
