@@ -104,7 +104,7 @@ void run_flash_fwd_sm100(Flash_fwd_params& params, cudaStream_t stream) {
     }
 
     // Calculate grid dimensions
-    dim3 grid(num_m_blocks, num_batch_heads, 1);
+    dim3 grid(num_m_blocks, params.h, params.b);
     dim3 block(Ktraits::kNThreads, 1, 1);
 
     // Launch kernel
