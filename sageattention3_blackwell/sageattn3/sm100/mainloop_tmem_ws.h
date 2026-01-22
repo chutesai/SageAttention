@@ -44,6 +44,10 @@ namespace flash {
 using namespace cute;
 using namespace cutlass::fmha::collective;
 
+// Import CUTLASS types for conversion
+using cutlass::Array;
+using cutlass::NumericArrayConverter;
+
 ///////////////////////////////////////////////////////////////////////////////
 // Causal mask implementation
 ///////////////////////////////////////////////////////////////////////////////
