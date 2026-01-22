@@ -26,8 +26,10 @@
 #include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
 
 using namespace cute;
-using namespace cutlass::fmha::kernel;
-using namespace cutlass::fmha::collective;
+
+// Bring in specific types from CUTLASS namespaces
+namespace fmha_kernel = cutlass::fmha::kernel;
+namespace fmha_collective = cutlass::fmha::collective;
 
 ///////////////////////////////////////////////////////////////////////////////
 // SM100 FMHA Kernel Types (matching CUTLASS example 77 exactly)
@@ -56,23 +58,23 @@ using StrideO = StrideQ;
 using StrideLSE = cute::tuple<_1, cute::tuple<cute::tuple<int, int>, int>>;
 
 // Build kernel types for causal and non-causal variants
-template <typename Mask>
+template <typename ActiveMask>
 struct FmhaKernel {
-    using TileScheduler = PersistentTileScheduler;
+    using TileScheduler = fmha_kernel::PersistentTileScheduler;
 
-    using Mainloop = Sm100FmhaFwdMainloopTmaWarpspecialized<
+    using Mainloop = fmha_collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
         Element, ElementAccumulatorQK, ElementAccumulatorPV,
         TileShape, StrideQ, StrideK, StrideV,
-        Mask
+        ActiveMask
     >;
 
-    using Epilogue = Sm100FmhaFwdEpilogueTmaWarpspecialized<
+    using Epilogue = fmha_collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
         ElementOut, ElementAccumulatorPV,
         typename Mainloop::TileShapePV,
         StrideO, StrideLSE
     >;
 
-    using Kernel = Sm100FmhaFwdKernelTmaWarpspecialized<
+    using Kernel = fmha_kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
         ProblemShape,
         Mainloop,
         Epilogue,
@@ -82,8 +84,8 @@ struct FmhaKernel {
     using Operation = cutlass::fmha::device::FMHA<Kernel>;
 };
 
-using FmhaNoMask = FmhaKernel<NoMask>;
-using FmhaCausal = FmhaKernel<CausalMask>;
+using FmhaNoMask = FmhaKernel<fmha_collective::NoMask>;
+using FmhaCausal = FmhaKernel<fmha_collective::CausalMask>;
 
 ///////////////////////////////////////////////////////////////////////////////
 // Kernel Launch Function
