@@ -161,8 +161,11 @@ at::Tensor mha_fwd_sm100(at::Tensor& q,
     const int head_dim_packed = sizes[3];
     const int head_dim = head_dim_packed * 2;  // FP4 is 4 bits, packed 2 per byte
 
-    TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                "SM100 kernel supports head_dim 64 or 128, got ", head_dim);
+    // SM100 with FP4 requires HeadDim >= 128 due to TMA load constraint
+    // (TileShape_K must be divisible by 128 for FP4 data)
+    TORCH_CHECK(head_dim == 128 || head_dim == 256,
+                "SM100 kernel with FP4 requires head_dim >= 128 (TMA constraint). Got ", head_dim,
+                ". For head_dim=64, use SM120 (RTX 5090) kernel or FP8 data format.");
 
     // Create output tensors if needed
     if (out.numel() == 0) {
@@ -182,10 +185,13 @@ at::Tensor mha_fwd_sm100(at::Tensor& q,
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     // Dispatch based on head dimension
-    if (head_dim == 64) {
-        flash::run_mha_fwd_sm100_<uint8_t, 64, cutlass::bfloat16_t>(params, stream);
-    } else {
+    // Note: HeadDim=64 not supported on SM100 with FP4 due to TMA constraint
+    if (head_dim == 128) {
         flash::run_mha_fwd_sm100_<uint8_t, 128, cutlass::bfloat16_t>(params, stream);
+    } else if (head_dim == 256) {
+        flash::run_mha_fwd_sm100_<uint8_t, 256, cutlass::bfloat16_t>(params, stream);
+    } else {
+        TORCH_CHECK(false, "Unsupported head_dim for SM100: ", head_dim);
     }
 
     return out;

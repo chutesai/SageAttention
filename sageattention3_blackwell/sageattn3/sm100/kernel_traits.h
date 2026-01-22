@@ -198,7 +198,12 @@ struct Flash_fwd_kernel_traits_sm100 {
     static constexpr bool BlockMean = BlockMean_;
     static constexpr bool SmoothQ = true;
 
-    static_assert(kBlockM == 128 || kBlockM == 256, "SM100 supports M=128 or M=256");
+    // SM100 requires M >= 128 AFTER ThreadShape division
+    // With ThreadShape = (2,1,1), we need kBlockM >= 256 to get TileShapeQK.M >= 128
+    static_assert(kBlockM == 256, "SM100 requires kBlockM=256 (TileShapeQK.M=128 after ThreadShape division)");
+    // SM100 with FP4 requires TileShape_K >= 128 (hardware constraint for F4/F6 TMA loads)
+    // Since TileShape_K = HeadDim, we require HeadDim >= 128
+    static_assert(kHeadDim >= 128, "SM100 with FP4 requires HeadDim >= 128 (TMA load constraint)");
     static_assert(kHeadDim % 32 == 0);
 
     // Warp scheduling
@@ -240,8 +245,9 @@ struct Flash_fwd_kernel_traits_sm100 {
     // Architecture tag
     using ArchTag = cutlass::arch::Sm100;
 
-    // Alignment
-    static constexpr int Alignment = 128 / sizeof_bits_v<Element>;
+    // Alignment - For FP4 (4-bit), SM100 requires 512-bit (64-byte) alignment
+    // This means 512 / 4 = 128 elements
+    static constexpr int Alignment = 512 / sizeof_bits_v<Element>;
 
     ///////////////////////////////////////////////////////////////////////////
     // MMA Configuration using CollectiveBuilder

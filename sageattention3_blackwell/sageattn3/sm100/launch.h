@@ -126,14 +126,19 @@ template <typename T, int Headdim, typename O = cutlass::bfloat16_t>
 void run_mha_fwd_sm100_(Flash_fwd_params& params, cudaStream_t stream) {
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
         BOOL_SWITCH(params.per_block_mean, per_block, [&] {
-            if constexpr (Headdim == 64) {
-                using Ktraits = Flash_fwd_kernel_traits_sm100<64, 128, 128, 3, 1, per_block, T, O>;
+            // SM100 with FP4:
+            //   - kBlockM=256 because TileShapeQK = TileShape / ThreadShape<2,1,1>, giving M=128
+            //   - HeadDim >= 128 required by FP4 TMA load constraint (TileShape_K % 128 == 0)
+            if constexpr (Headdim == 128) {
+                using Ktraits = Flash_fwd_kernel_traits_sm100<128, 256, 128, 3, 1, per_block, T, O>;
                 run_flash_fwd_sm100<Ktraits, Is_causal>(params, stream);
-            } else if constexpr (Headdim == 128) {
-                using Ktraits = Flash_fwd_kernel_traits_sm100<128, 128, 128, 3, 1, per_block, T, O>;
+            } else if constexpr (Headdim == 256) {
+                using Ktraits = Flash_fwd_kernel_traits_sm100<256, 256, 128, 3, 1, per_block, T, O>;
                 run_flash_fwd_sm100<Ktraits, Is_causal>(params, stream);
             } else {
-                static_assert(Headdim == 64 || Headdim == 128, "Unsupported Headdim for SM100");
+                // HeadDim=64 not supported on SM100 with FP4 due to TMA load constraint
+                static_assert(Headdim == 128 || Headdim == 256,
+                    "SM100 with FP4 requires HeadDim >= 128 (TMA load constraint)");
             }
         });
     });
