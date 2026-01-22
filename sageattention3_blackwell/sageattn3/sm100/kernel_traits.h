@@ -41,6 +41,7 @@
 #include "cutlass/gemm/collective/builders/sm100_common.inl"
 #include "cute/arch/tmem_allocator_sm100.hpp"
 #include "cute/arch/mma_sm100_umma.hpp"
+#include "cute/atom/mma_traits_sm100.hpp"  // For UMMA::Layout_K_SW128_Atom
 
 #include "../blackwell/blockscaled_layout.h"
 #include "../blackwell/named_barrier.h"
@@ -256,13 +257,14 @@ struct Flash_fwd_kernel_traits_sm100 {
     // MMA Configuration (manual, similar to SM120)
     //
     // Use SM100 UMMA blockscaled MMA atoms for FP4
-    // For MXF4_NVF4 instruction (FP4 x FP4), IsF8F6F4 = false
+    // For MXF4_NVF4 instruction (FP4 x FP4), the MMA element type is the same as input
+    // (no SMEM unpacking transformation needed, unlike MXF8F6F4)
     ///////////////////////////////////////////////////////////////////////////
 
-    // MMA input element type conversion
-    // For MXF4 instruction: IsF8F6F4 = false, so element type stays as-is
-    using ElementQMma = decltype(cutlass::gemm::collective::detail::sm100_kernel_input_element_to_mma_input_element<Element, false>());
-    using ElementKMma = decltype(cutlass::gemm::collective::detail::sm100_kernel_input_element_to_mma_input_element<Element, false>());
+    // MMA input element type - for MXF4 instruction with FP4, use the element type directly
+    // This matches sm100_kernel_input_element_to_mma_input_element<Element, false>() behavior
+    using ElementQMma = Element;
+    using ElementKMma = Element;
 
     // Atom layout for 128 rows
     using AtomLayoutMNK = Layout<Shape<_8, _1, _1>>;
@@ -302,23 +304,14 @@ struct Flash_fwd_kernel_traits_sm100 {
     using GmemTiledCopySF = SM90_TMA_LOAD;
 
     ///////////////////////////////////////////////////////////////////////////
-    // SMEM Layouts (manual, using SM100 selectors)
+    // SMEM Layouts (manual, using UMMA layouts directly)
     ///////////////////////////////////////////////////////////////////////////
 
-    // For blockscaled FP4 (MXF4_NVF4), use ElementQMma for SMEM allocation
-    // This gives proper swizzling for the 4-bit data type
-    using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
-        UMMA::Major::K, ElementQMma,
-        decltype(cute::get<0>(TileShapeQK{})),
-        decltype(cute::get<2>(TileShapeQK{}))>());
-    using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
-        UMMA::Major::K, ElementKMma,
-        decltype(cute::get<1>(TileShapeQK{})),
-        decltype(cute::get<2>(TileShapeQK{}))>());
-    using SmemLayoutAtomV = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
-        UMMA::Major::K, ElementKMma,
-        decltype(cute::get<1>(TileShapePV{})),
-        decltype(cute::get<2>(TileShapePV{}))>());
+    // For FP4 data (K-major), use UMMA::Layout_K_SW128_Atom which properly handles sub-byte types
+    // The layout atom handles swizzling for TMA loads with the correct element size
+    using SmemLayoutAtomQ = UMMA::Layout_K_SW128_Atom<Element>;
+    using SmemLayoutAtomK = UMMA::Layout_K_SW128_Atom<Element>;
+    using SmemLayoutAtomV = UMMA::Layout_K_SW128_Atom<Element>;
 
     // Q: single stage, 2 tiles (for ThreadShape=(2,1,1))
     using SmemLayoutQ = decltype(tile_to_shape(
