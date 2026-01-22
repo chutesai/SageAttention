@@ -387,23 +387,29 @@ struct Flash_fwd_kernel_traits_sm100 {
         SmemLayoutAtomV{},
         select<1, 2>(TileShapePV{})));
 
+    // TMA strides for 2D tensor access (seq x dim for each batch/head)
+    // TMA loads 2D tiles, so we use 2D strides
+    using StrideTmaQ = Stride<int64_t, _1>;  // (seq_stride, dim_stride=1)
+    using StrideTmaK = Stride<int64_t, _1>;
+    using StrideTmaV = Stride<_1, int64_t>;  // V is transposed: (dim_stride=1, seq_stride)
+
     using TMA_Q = decltype(make_tma_copy(
         SM90_TMA_LOAD{},
-        make_tensor(static_cast<Element const*>(nullptr), make_shape(1, 1, 1), StrideQ{}),
+        make_tensor(static_cast<Element const*>(nullptr), make_shape(1, 1), StrideTmaQ{}),
         SmemLayoutQTma{},
         select<0, 2>(TileShapeQK{}),
         _1{}));
 
     using TMA_K = decltype(make_tma_copy(
         SM90_TMA_LOAD{},
-        make_tensor(static_cast<Element const*>(nullptr), make_shape(1, 1, 1), StrideK{}),
+        make_tensor(static_cast<Element const*>(nullptr), make_shape(1, 1), StrideTmaK{}),
         SmemLayoutKTma{},
         select<1, 2>(TileShapeQK{}),
         _1{}));
 
     using TMA_V = decltype(make_tma_copy(
         SM90_TMA_LOAD{},
-        make_tensor(static_cast<Element const*>(nullptr), make_shape(1, 1, 1), StrideV{}),
+        make_tensor(static_cast<Element const*>(nullptr), make_shape(1, 1), StrideTmaV{}),
         SmemLayoutVTma{},
         select<1, 2>(TileShapePV{}),
         _1{}));
