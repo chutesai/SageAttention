@@ -99,10 +99,6 @@ struct Sm100FlashFwdKernelFP4 {
         int seqlen_k;
         int num_heads;
         int batch_size;
-        ElementOut* ptr_O;
-        int64_t stride_O_seq;
-        int64_t stride_O_head;
-        int64_t stride_O_batch;
     };
 
     static Params to_underlying_arguments(Arguments const& args, void* workspace) {
@@ -112,7 +108,7 @@ struct Sm100FlashFwdKernelFP4 {
             make_tuple(args.num_heads, args.batch_size)
         );
 
-        // Mainloop now directly uses kernel arguments
+        // Mainloop now directly uses kernel arguments (including output)
         auto mainloop_params = CollectiveMainloop::to_underlying_arguments(args, workspace);
 
         typename TileScheduler::Arguments scheduler_args{};
@@ -125,11 +121,7 @@ struct Sm100FlashFwdKernelFP4 {
             args.seqlen_q,
             args.seqlen_k,
             args.num_heads,
-            args.batch_size,
-            args.ptr_O,
-            args.stride_O_seq,
-            args.stride_O_head,
-            args.stride_O_batch
+            args.batch_size
         };
     }
 
@@ -164,7 +156,7 @@ struct Sm100FlashFwdKernelFP4 {
 
         auto [m_block, head_idx, batch_idx] = work_tile.get_block_coord();
 
-        // Run mainloop
+        // Run mainloop (includes output write)
         CollectiveMainloop mainloop;
         mainloop(
             params.mainloop,
@@ -175,34 +167,6 @@ struct Sm100FlashFwdKernelFP4 {
             params.seqlen_q,
             params.seqlen_k
         );
-
-        // Epilogue - write output to GMEM
-        // For now, write zeros as a placeholder
-        // The actual implementation will write the accumulated output
-        int thread_idx = threadIdx.x;
-        int row_start = m_block * kBlockM;
-        int rows_this_tile = min(kBlockM, params.seqlen_q - row_start);
-
-        // Each thread writes a portion of the output
-        // Output layout: [batch, heads, seqlen_q, head_dim]
-        ElementOut* ptr_O_base = params.ptr_O +
-            batch_idx * params.stride_O_batch +
-            head_idx * params.stride_O_head +
-            row_start * params.stride_O_seq;
-
-        // Simple epilogue: each thread writes multiple elements
-        constexpr int kElementsPerThread = (kBlockM * kHeadDim) / kNThreads;
-
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < kElementsPerThread; ++i) {
-            int elem_idx = thread_idx * kElementsPerThread + i;
-            int row = elem_idx / kHeadDim;
-            int col = elem_idx % kHeadDim;
-
-            if (row < rows_this_tile) {
-                ptr_O_base[row * params.stride_O_seq + col] = ElementOut(0.0f);
-            }
-        }
     }
 };
 

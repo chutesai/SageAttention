@@ -95,14 +95,6 @@ struct CollectiveMainloopFwdSm100FP4 {
     using SmemLayoutSFB_QK = typename Ktraits::SmemLayoutSFB_QK;
     using SmemLayoutSFB_PV = typename Ktraits::SmemLayoutSFB_PV;
 
-    // TMA types from CollectiveBuilder
-    using TMA_Q = typename Ktraits::TMA_Q;
-    using TMA_K = typename Ktraits::TMA_K;
-    using TMA_V = typename Ktraits::TMA_V;
-    using TMA_SFA = typename Ktraits::TMA_SFA;
-    using TMA_SFB = typename Ktraits::TMA_SFB;
-    using TMA_SFV = typename Ktraits::TMA_SFV;
-
     // Strides
     using StrideQ = typename Ktraits::StrideQ;
     using StrideK = typename Ktraits::StrideK;
@@ -122,54 +114,84 @@ struct CollectiveMainloopFwdSm100FP4 {
     using Mask = std::conditional_t<Is_causal, CausalMaskFP4, NoMaskFP4>;
 
     ///////////////////////////////////////////////////////////////////////////
-    // Parameters
+    // Parameters - simplified for FP4 attention
+    // TMA construction is complex for block-scaled ops; we use a simpler
+    // direct GMEM approach initially to get functional correctness
     ///////////////////////////////////////////////////////////////////////////
 
     struct Params {
-        // TMA descriptors for data
-        TMA_Q tma_load_q;
-        TMA_K tma_load_k;
-        TMA_V tma_load_v;
+        // Q data and scale factors
+        ElementData const* ptr_Q;
+        ElementSF const* ptr_SFQ;
+        int64_t stride_Q_seq;
+        int64_t stride_Q_head;
+        int64_t stride_Q_batch;
 
-        // TMA descriptors for scale factors
-        TMA_SFA tma_load_sfq;
-        TMA_SFB tma_load_sfk;
-        TMA_SFV tma_load_sfv;
+        // K data and scale factors
+        ElementData const* ptr_K;
+        ElementSF const* ptr_SFK;
+        int64_t stride_K_seq;
+        int64_t stride_K_head;
+        int64_t stride_K_batch;
 
-        // Scale factor layouts
-        LayoutSFA layout_sfq;
-        LayoutSFB layout_sfk;
-        LayoutSFB layout_sfv;
+        // V data and scale factors
+        ElementData const* ptr_V;
+        ElementSF const* ptr_SFV;
+        int64_t stride_V_seq;
+        int64_t stride_V_head;
+        int64_t stride_V_batch;
+
+        // Output tensor
+        ElementOut* ptr_O;
+        int64_t stride_O_seq;
+        int64_t stride_O_head;
+        int64_t stride_O_batch;
 
         float scale_softmax;
         float scale_softmax_log2;
     };
 
-    template <typename KernelArgs>
+    // Forward declaration for kernel Arguments type
+    template <typename KernelArguments>
     static Params to_underlying_arguments(
-        KernelArgs const& args,
+        KernelArguments const& args,
         void* workspace
     ) {
         float log2_e = static_cast<float>(M_LOG2E);
 
-        // For now, return a minimal Params struct
-        // The actual TMA descriptor construction requires problem shape info
-        // which we don't have here. This will be set up properly when we
-        // integrate with the full kernel infrastructure.
-
         return Params{
-            TMA_Q{},
-            TMA_K{},
-            TMA_V{},
-            TMA_SFA{},
-            TMA_SFB{},
-            TMA_SFV{},
-            LayoutSFA{},
-            LayoutSFB{},
-            LayoutSFB{},
+            args.ptr_Q,
+            args.ptr_SFQ,
+            args.stride_Q_seq,
+            args.stride_Q_head,
+            args.stride_Q_batch,
+
+            args.ptr_K,
+            args.ptr_SFK,
+            args.stride_K_seq,
+            args.stride_K_head,
+            args.stride_K_batch,
+
+            args.ptr_V,
+            args.ptr_SFV,
+            args.stride_V_seq,
+            args.stride_V_head,
+            args.stride_V_batch,
+
+            args.ptr_O,
+            args.stride_O_seq,
+            args.stride_O_head,
+            args.stride_O_batch,
+
             args.scale_softmax,
             args.scale_softmax * log2_e
         };
+    }
+
+    CUTLASS_DEVICE
+    static void prefetch_tma_descriptors(Params const& params) {
+        // No TMA descriptors in simplified version
+        // Will be added when we implement TMA-based loading
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -192,7 +214,7 @@ struct CollectiveMainloopFwdSm100FP4 {
 
         // Problem shape for this tile
         auto problem_shape = make_tuple(seqlen_q, seqlen_k, kHeadDim,
-                                        make_tuple(1, 1));  // heads, batch handled externally
+                                        make_tuple(1, 1));
 
         // Calculate number of K/V tiles to process
         Mask mask;
@@ -202,33 +224,167 @@ struct CollectiveMainloopFwdSm100FP4 {
         // Early exit if no tiles to process
         if (num_kv_tiles <= 0) return;
 
-        // Create SMEM tensors
-        Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
-        Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
-        Tensor sV = make_tensor(make_smem_ptr(storage.smem_v.data()), SmemLayoutV{});
+        // Row start in Q for this block
+        int row_start = m_block * kBlockM;
+        int rows_this_tile = min(kBlockM, seqlen_q - row_start);
 
-        // Create SMEM tensors for scale factors
-        Tensor sSFQ = make_tensor(make_smem_ptr(storage.smem_sfq.data()), SmemLayoutSFA{});
-        Tensor sSFK = make_tensor(make_smem_ptr(storage.smem_sfk.data()), SmemLayoutSFB_QK{});
-        Tensor sSFV = make_tensor(make_smem_ptr(storage.smem_sfv.data()), SmemLayoutSFB_PV{});
+        // =====================================================================
+        // SIMPLIFIED FP4 ATTENTION IMPLEMENTATION
+        // This uses direct GMEM access instead of TMA for initial correctness.
+        // Full warp-specialized TMA implementation will follow.
+        // =====================================================================
 
-        // The full implementation would:
-        // 1. Set up TMA tensors using params.tma_load_*.get_tma_tensor()
-        // 2. Partition with tma_partition()
-        // 3. Load Q and its scale factors via TMA
-        // 4. For each K/V tile:
-        //    a. Load K, K scale factors via TMA
-        //    b. Execute QK block-scaled GEMM
-        //    c. Apply softmax scaling
-        //    d. Compute online softmax
-        //    e. Quantize P to FP4 (on-the-fly scale factor generation)
-        //    f. Load V, V scale factors via TMA
-        //    g. Execute PV block-scaled GEMM
-        //    h. Correct output accumulator
-        // 5. Normalize and write output
+        // Per-thread accumulator for output (FP32)
+        // Each thread handles a subset of the output elements
+        constexpr int kRowsPerThread = kBlockM / kNThreads * kHeadDim;
+        float thread_output[kHeadDim];  // One row per thread for simplicity
 
-        // For now, this is a placeholder that ensures compilation
+        // Initialize output to zero
+        CUTLASS_PRAGMA_UNROLL
+        for (int d = 0; d < kHeadDim; ++d) {
+            thread_output[d] = 0.0f;
+        }
+
+        // Online softmax state per row handled by this thread
+        float row_max = -INFINITY;
+        float row_sum = 0.0f;
+
+        // Which row does this thread handle
+        int my_row = thread_idx % kBlockM;
+        int global_row = row_start + my_row;
+
+        if (my_row >= rows_this_tile) {
+            // This thread doesn't have valid work
+            __syncthreads();
+            return;
+        }
+
+        // Compute base pointers for this batch/head
+        ElementData const* Q_base = params.ptr_Q +
+            batch_idx * params.stride_Q_batch +
+            head_idx * params.stride_Q_head +
+            global_row * params.stride_Q_seq;
+
+        ElementSF const* SFQ_base = params.ptr_SFQ +
+            batch_idx * params.stride_Q_batch / kSFVectorSize +
+            head_idx * params.stride_Q_head / kSFVectorSize +
+            global_row * params.stride_Q_seq / kSFVectorSize;
+
+        // Loop over K/V tiles
+        for (int n_tile = 0; n_tile < num_kv_tiles; ++n_tile) {
+            int k_start = n_tile * kBlockN;
+            int cols_this_tile = min(kBlockN, seqlen_k - k_start);
+
+            // For causal: check if this K tile has any valid positions
+            if constexpr (Is_causal) {
+                if (k_start > global_row) {
+                    continue;  // Skip tiles entirely after causal boundary
+                }
+            }
+
+            // Compute S = Q @ K^T for this tile
+            // For each valid K position in this tile
+            for (int k_col = 0; k_col < cols_this_tile; ++k_col) {
+                int global_k = k_start + k_col;
+
+                // Causal mask check
+                if constexpr (Is_causal) {
+                    if (global_k > global_row) {
+                        continue;
+                    }
+                }
+
+                // Compute dot product Q[my_row] @ K[k_col]
+                ElementData const* K_base = params.ptr_K +
+                    batch_idx * params.stride_K_batch +
+                    head_idx * params.stride_K_head +
+                    global_k * params.stride_K_seq;
+
+                ElementSF const* SFK_base = params.ptr_SFK +
+                    batch_idx * params.stride_K_batch / kSFVectorSize +
+                    head_idx * params.stride_K_head / kSFVectorSize +
+                    global_k * params.stride_K_seq / kSFVectorSize;
+
+                // Block-scaled dot product: sum over blocks
+                float dot = 0.0f;
+                for (int blk = 0; blk < kHeadDim / kSFVectorSize; ++blk) {
+                    // Get scale factors for this block
+                    float sf_q = static_cast<float>(SFQ_base[blk]);
+                    float sf_k = static_cast<float>(SFK_base[blk]);
+                    float scale = sf_q * sf_k;
+
+                    // Dot product within block (FP4 values)
+                    for (int i = 0; i < kSFVectorSize; ++i) {
+                        int idx = blk * kSFVectorSize + i;
+                        float q_val = static_cast<float>(Q_base[idx]);
+                        float k_val = static_cast<float>(K_base[idx]);
+                        dot += q_val * k_val * scale;
+                    }
+                }
+
+                // Apply softmax scale
+                float s = dot * params.scale_softmax;
+
+                // Online softmax update
+                float old_max = row_max;
+                row_max = fmaxf(row_max, s);
+                float correction = expf(old_max - row_max);
+                row_sum = row_sum * correction + expf(s - row_max);
+
+                // Correct previous output accumulator
+                CUTLASS_PRAGMA_UNROLL
+                for (int d = 0; d < kHeadDim; ++d) {
+                    thread_output[d] *= correction;
+                }
+
+                // Add contribution from this K position
+                // P[my_row, k_col] = exp(s - row_max)
+                float p = expf(s - row_max);
+
+                // V contribution: O += P * V
+                ElementData const* V_base = params.ptr_V +
+                    batch_idx * params.stride_V_batch +
+                    head_idx * params.stride_V_head +
+                    global_k * params.stride_V_seq;
+
+                ElementSF const* SFV_base = params.ptr_SFV +
+                    batch_idx * params.stride_V_batch / kSFVectorSize +
+                    head_idx * params.stride_V_head / kSFVectorSize +
+                    global_k * params.stride_V_seq / kSFVectorSize;
+
+                for (int blk = 0; blk < kHeadDim / kSFVectorSize; ++blk) {
+                    float sf_v = static_cast<float>(SFV_base[blk]);
+                    for (int i = 0; i < kSFVectorSize; ++i) {
+                        int d = blk * kSFVectorSize + i;
+                        float v_val = static_cast<float>(V_base[d]) * sf_v;
+                        thread_output[d] += p * v_val;
+                    }
+                }
+            }
+        }
+
+        // Normalize output by row_sum
+        if (row_sum > 0.0f) {
+            float inv_sum = 1.0f / row_sum;
+            CUTLASS_PRAGMA_UNROLL
+            for (int d = 0; d < kHeadDim; ++d) {
+                thread_output[d] *= inv_sum;
+            }
+        }
+
         __syncthreads();
+
+        // Write output to GMEM
+        // Each thread writes one row (thread_idx % kBlockM)
+        ElementOut* O_base = params.ptr_O +
+            batch_idx * params.stride_O_batch +
+            head_idx * params.stride_O_head +
+            global_row * params.stride_O_seq;
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int d = 0; d < kHeadDim; ++d) {
+            O_base[d] = static_cast<ElementOut>(thread_output[d]);
+        }
     }
 };
 
