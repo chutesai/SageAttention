@@ -178,7 +178,12 @@ def test_smooth_with_delta_s(batch=1, heads=1, seqlen=256, head_dim=256, scale_f
 
     # Apply smooth attention preprocessing
     print(f"Input shapes: q={q.shape}, k={k.shape}, v={v.shape}")
+    print(f"Original Q stats: min={q.min().item():.4f}, max={q.max().item():.4f}, std={q.std().item():.4f}")
+    print(f"Original K stats: min={k.min().item():.4f}, max={k.max().item():.4f}, std={k.std().item():.4f}")
+
     q_smooth, k_smooth, v_smooth, delta_s = preprocess_smooth(q, k, v, per_block_mean=True)
+    print(f"Smoothed Q stats: min={q_smooth.min().item():.4f}, max={q_smooth.max().item():.4f}, std={q_smooth.std().item():.4f}")
+    print(f"Smoothed K stats: min={k_smooth.min().item():.4f}, max={k_smooth.max().item():.4f}, std={k_smooth.std().item():.4f}")
     print(f"After smooth: q_smooth={q_smooth.shape}, k_smooth={k_smooth.shape}, delta_s={delta_s.shape}")
 
     # Quantize smoothed inputs to FP4
