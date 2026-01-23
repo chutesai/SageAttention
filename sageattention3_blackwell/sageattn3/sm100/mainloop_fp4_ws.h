@@ -114,13 +114,20 @@ struct CollectiveMainloopFwdSm100FP4 {
     // direct GMEM approach initially to get functional correctness
     ///////////////////////////////////////////////////////////////////////////
 
-    // Helper to decode linear 4-bit value to float
-    // Input: 4-bit value (0-15), mapped from [-6, +6] via (x/6 * 7.5 + 7.5)
-    // Output: float in roughly [-1, +1] range (before scale factor)
-    CUTLASS_DEVICE static float decode_fp4_linear(uint8_t nibble) {
-        // Reverse the encoding: (nibble - 7.5) / 7.5 * 6.0
-        // Simplified: (nibble - 7.5) * 0.8
-        return (static_cast<float>(nibble) - 7.5f) * 0.8f;
+    // Helper to decode FP4 E2M1 nibble to float
+    // E2M1 format: 1 sign bit, 2 exponent bits, 1 mantissa bit
+    // Values: 0, 0.5, 1, 1.5, 2, 3, 4, 6 (and negatives)
+    // Nibble layout: S EE M where S=sign, EE=exponent, M=mantissa
+    CUTLASS_DEVICE static float decode_fp4_e2m1(uint8_t nibble) {
+        // E2M1 lookup table for positive values (nibbles 0-7)
+        // 0b000 = 0, 0b001 = 0.5, 0b010 = 1, 0b011 = 1.5
+        // 0b100 = 2, 0b101 = 3,   0b110 = 4, 0b111 = 6
+        constexpr float e2m1_lut[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+
+        bool sign = (nibble >> 3) & 1;
+        uint8_t magnitude = nibble & 0x7;
+        float value = e2m1_lut[magnitude];
+        return sign ? -value : value;
     }
 
     struct Params {
@@ -343,13 +350,13 @@ struct CollectiveMainloopFwdSm100FP4 {
                         uint8_t k_packed = K_base[byte_idx];
 
                         // Unpack low nibble (even index)
-                        float q_lo = decode_fp4_linear(q_packed & 0x0F);
-                        float k_lo = decode_fp4_linear(k_packed & 0x0F);
+                        float q_lo = decode_fp4_e2m1(q_packed & 0x0F);
+                        float k_lo = decode_fp4_e2m1(k_packed & 0x0F);
                         dot += q_lo * k_lo * scale;
 
                         // Unpack high nibble (odd index)
-                        float q_hi = decode_fp4_linear((q_packed >> 4) & 0x0F);
-                        float k_hi = decode_fp4_linear((k_packed >> 4) & 0x0F);
+                        float q_hi = decode_fp4_e2m1((q_packed >> 4) & 0x0F);
+                        float k_hi = decode_fp4_e2m1((k_packed >> 4) & 0x0F);
                         dot += q_hi * k_hi * scale;
                     }
                 }
@@ -394,8 +401,8 @@ struct CollectiveMainloopFwdSm100FP4 {
                         // Unpack and accumulate
                         int d_lo = blk * SFVecSize + i;
                         int d_hi = d_lo + 1;
-                        float v_lo = decode_fp4_linear(v_packed & 0x0F) * sf_v;
-                        float v_hi = decode_fp4_linear((v_packed >> 4) & 0x0F) * sf_v;
+                        float v_lo = decode_fp4_e2m1(v_packed & 0x0F) * sf_v;
+                        float v_hi = decode_fp4_e2m1((v_packed >> 4) & 0x0F) * sf_v;
                         thread_output[d_lo] += p * v_lo;
                         thread_output[d_hi] += p * v_hi;
                     }
