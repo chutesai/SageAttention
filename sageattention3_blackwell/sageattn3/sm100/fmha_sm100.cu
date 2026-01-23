@@ -135,7 +135,7 @@ using FmhaFP8Causal = FmhaKernelFP8<MaskCausal>;
 #include "kernel_fp4_ws.h"
 
 using ElementFP4 = cutlass::float_e2m1_t;
-using ElementFP4SF = cutlass::float_ue4m3_t;
+using ElementFP4SF = cutlass::float_e4m3_t;  // Signed E4M3 to match PyTorch float8_e4m3fn
 using ElementFP4Out = cutlass::bfloat16_t;
 
 // FP4 Kernel configuration
