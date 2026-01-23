@@ -64,12 +64,15 @@ def triton_group_mean(q: torch.Tensor):
     return q_out, qm
 
 
-def compute_delta_s(qm: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-    """Compute delta_s = qm @ k^T correction term.
+def compute_delta_s(qm: torch.Tensor, k_original: torch.Tensor) -> torch.Tensor:
+    """Compute delta_s = qm @ k_original^T correction term.
+
+    IMPORTANT: This uses the ORIGINAL K (not K_smooth)!
+    The math: delta_s = Qm @ K^T (not K_smooth)
 
     Args:
         qm: Query means [batch, heads, num_q_groups, head_dim]
-        k: Smoothed keys [batch, heads, seqlen_k, head_dim]
+        k_original: Original keys (NOT smoothed) [batch, heads, seqlen_k, head_dim]
 
     Returns:
         delta_s: [batch, heads, num_q_groups, seqlen_k] correction tensor
@@ -78,11 +81,11 @@ def compute_delta_s(qm: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     # k:  [B, H, N, D] where N = seqlen_k
     # output: [B, H, M, N]
     B, H, M, D = qm.shape
-    _, _, N, _ = k.shape
+    _, _, N, _ = k_original.shape
 
     # Do computation on CPU then move back to avoid CUBLAS issues
     qm_cpu = qm.float().cpu()
-    k_cpu = k.float().cpu()
+    k_cpu = k_original.float().cpu()
     result_cpu = torch.matmul(qm_cpu, k_cpu.transpose(-2, -1))
     return result_cpu.to(qm.device)
 
@@ -94,7 +97,11 @@ def preprocess_smooth(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_blo
         q_smooth: Q with mean subtracted
         k_smooth: K with global mean subtracted
         v: V unchanged
-        delta_s: Correction term qm @ k^T [batch, heads, num_q_groups, seqlen_k]
+        delta_s: Correction term qm @ k_original^T [batch, heads, num_q_groups, seqlen_k]
+
+    IMPORTANT: delta_s uses ORIGINAL K (not K_smooth) because:
+    S_smooth + delta_s = (Q-Qm) @ (K-Km)^T + Qm @ K^T
+    The residual (Q @ Km^T - Qm @ Km^T) is per-row constant, cancels in softmax.
     """
     # Smooth K: subtract global mean
     k_smooth = k - k.mean(dim=-2, keepdim=True)
@@ -108,8 +115,8 @@ def preprocess_smooth(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_blo
 
     print(f"  qm shape: {qm.shape}, k_smooth shape: {k_smooth.shape}")
 
-    # Compute correction term: qm @ k_smooth^T
-    delta_s = compute_delta_s(qm, k_smooth)
+    # Compute correction term: qm @ k_ORIGINAL^T (NOT k_smooth!)
+    delta_s = compute_delta_s(qm, k)  # Use original k, not k_smooth!
 
     return q_smooth, k_smooth, v, delta_s
 
@@ -252,7 +259,39 @@ def test_without_smooth(batch=1, heads=1, seqlen=256, head_dim=256, scale_factor
 
 
 def verify_smooth_math():
-    """Verify that smooth attention math is correct in pure PyTorch (on CPU)."""
+    """Verify that smooth attention math is correct in pure PyTorch (on CPU).
+
+    Key insight: The smooth attention mechanism doesn't try to exactly reconstruct
+    the original attention scores. Instead:
+
+    1. K is smoothed globally: K_smooth = K - Km (Km = mean over sequence)
+    2. Q is smoothed per-block: Q_smooth = Q - Qm (Qm = mean per 128-element block)
+    3. delta_s = Qm @ K_smooth^T corrects the per-block Q mean subtraction
+
+    The term Q @ Km^T is a constant offset per row that cancels in softmax!
+    So we don't need to correct for it.
+
+    The math:
+    S_orig = Q @ K^T
+    S_smooth = Q_smooth @ K_smooth^T = (Q - Qm) @ (K - Km)^T
+             = Q @ K^T - Q @ Km^T - Qm @ K^T + Qm @ Km^T
+
+    After softmax, the Q @ Km^T term (constant per row) cancels out.
+    So we only need to correct for: -Qm @ K^T + Qm @ Km^T = -Qm @ (K - Km)^T = -Qm @ K_smooth^T
+
+    Wait, that's negative! Let me re-derive...
+
+    Actually, looking at SM120 code, delta_s = Qm @ K^T (using original K, not K_smooth)
+    And it's ADDED to the smooth scores.
+
+    Let's verify what reconstruction should be:
+    S_smooth + delta_s = (Q - Qm) @ (K - Km)^T + Qm @ K^T
+                       = Q @ K^T - Q @ Km^T - Qm @ K^T + Qm @ Km^T + Qm @ K^T
+                       = Q @ K^T - Q @ Km^T + Qm @ Km^T
+
+    The remaining difference is: S_orig - (S_smooth + delta_s) = Q @ Km^T - Qm @ Km^T
+    This is a per-row constant (same value for all K positions in a row), which cancels in softmax!
+    """
     print("\n" + "="*60)
     print("VERIFICATION: Smooth attention math in pure PyTorch (CPU)")
     print("="*60)
@@ -270,8 +309,9 @@ def verify_smooth_math():
     # Original attention scores: S = Q @ K^T * scale
     S_orig = torch.matmul(q, k.transpose(-2, -1)) * softmax_scale
 
-    # Smooth Q and K
-    k_smooth = k - k.mean(dim=-2, keepdim=True)
+    # Smooth K with global mean
+    km = k.mean(dim=-2, keepdim=True)  # [batch, heads, 1, head_dim]
+    k_smooth = k - km
 
     # Per-block (128) Q mean subtraction
     GROUP_SIZE = 128
@@ -282,30 +322,54 @@ def verify_smooth_math():
     # Smooth attention scores: S_smooth = Q_smooth @ K_smooth^T * scale
     S_smooth = torch.matmul(q_smooth, k_smooth.transpose(-2, -1)) * softmax_scale
 
-    # Delta-S correction: delta_s = Qm @ K_smooth^T * scale
-    # Shape: [batch, heads, num_groups, seqlen_k]
-    delta_s = torch.matmul(qm, k_smooth.transpose(-2, -1)) * softmax_scale
+    # Delta-S correction: delta_s = Qm @ K^T * scale (using ORIGINAL K, not K_smooth!)
+    # This is what SM120 does
+    delta_s = torch.matmul(qm, k.transpose(-2, -1)) * softmax_scale
 
     # Expand delta_s to match S shape
-    # Each delta_s[g] applies to rows [g*128 : (g+1)*128]
     delta_s_expanded = delta_s.unsqueeze(3).expand(batch, heads, seqlen // GROUP_SIZE, GROUP_SIZE, seqlen)
     delta_s_expanded = delta_s_expanded.reshape(batch, heads, seqlen, seqlen)
 
     # Reconstructed: S_reconstructed = S_smooth + delta_s
     S_reconstructed = S_smooth + delta_s_expanded
 
-    # Compare
-    diff = (S_orig - S_reconstructed).abs()
-    print(f"S_orig vs S_smooth+delta_s:")
-    print(f"  Max diff:  {diff.max().item():.6f}")
-    print(f"  Mean diff: {diff.mean().item():.6f}")
+    # The residual should be Q @ Km^T - Qm @ Km^T, which is per-row constant
+    residual = S_orig - S_reconstructed
 
-    if diff.max().item() < 1e-5:
-        print("  PASS: Smooth attention math is correct!")
+    # Check if residual is per-row constant (variance across columns should be ~0)
+    residual_row_var = residual.var(dim=-1).mean().item()
+    print(f"Residual variance across columns (should be ~0): {residual_row_var:.10f}")
+
+    # Compute per-row constant term: Q @ Km^T - Qm @ Km^T
+    expected_row_constant = torch.matmul(q, km.transpose(-2, -1)) * softmax_scale  # [B, H, seqlen, 1]
+    qm_km = torch.matmul(qm, km.transpose(-2, -1)) * softmax_scale  # [B, H, num_groups, 1]
+    qm_km_expanded = qm_km.unsqueeze(3).expand(batch, heads, seqlen // GROUP_SIZE, GROUP_SIZE, 1)
+    qm_km_expanded = qm_km_expanded.reshape(batch, heads, seqlen, 1)
+    expected_row_constant = expected_row_constant - qm_km_expanded
+
+    # The residual should equal expected_row_constant broadcasted across columns
+    expected_residual = expected_row_constant.expand_as(residual)
+    residual_vs_expected = (residual - expected_residual).abs()
+
+    print(f"Residual vs expected row constant:")
+    print(f"  Max diff:  {residual_vs_expected.max().item():.10f}")
+    print(f"  Mean diff: {residual_vs_expected.mean().item():.10f}")
+
+    # The key test: After softmax, does smooth+delta_s give same result as original?
+    P_orig = F.softmax(S_orig, dim=-1)
+    P_smooth = F.softmax(S_reconstructed, dim=-1)
+
+    softmax_diff = (P_orig - P_smooth).abs()
+    print(f"\nSoftmax(S_orig) vs Softmax(S_smooth+delta_s):")
+    print(f"  Max diff:  {softmax_diff.max().item():.10f}")
+    print(f"  Mean diff: {softmax_diff.mean().item():.10f}")
+
+    if softmax_diff.max().item() < 1e-6:
+        print("  PASS: Smooth attention gives same softmax output!")
+        return True
     else:
-        print("  FAIL: There's an error in the smooth attention math!")
-
-    return diff.max().item() < 1e-5
+        print("  FAIL: Softmax outputs differ!")
+        return False
 
 
 def main():
