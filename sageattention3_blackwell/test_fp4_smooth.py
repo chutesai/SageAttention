@@ -77,7 +77,10 @@ def compute_delta_s(qm: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     # qm: [B, H, M, D] where M = num_q_groups
     # k:  [B, H, N, D] where N = seqlen_k
     # output: [B, H, M, N]
-    return torch.matmul(qm.float(), k.float().transpose(-2, -1))
+    # Ensure contiguous tensors for matmul
+    qm_f = qm.float().contiguous()
+    k_f = k.float().contiguous()
+    return torch.matmul(qm_f, k_f.transpose(-2, -1))
 
 
 def preprocess_smooth(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_mean: bool = True):
@@ -161,7 +164,9 @@ def test_smooth_with_delta_s(batch=1, heads=1, seqlen=256, head_dim=256, scale_f
         ref = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
     # Apply smooth attention preprocessing
+    print(f"Input shapes: q={q.shape}, k={k.shape}, v={v.shape}")
     q_smooth, k_smooth, v_smooth, delta_s = preprocess_smooth(q, k, v, per_block_mean=True)
+    print(f"After smooth: q_smooth={q_smooth.shape}, k_smooth={k_smooth.shape}, delta_s={delta_s.shape}")
 
     # Quantize smoothed inputs to FP4
     q_data, q_sf = quantize_bf16_to_fp4(q_smooth)
