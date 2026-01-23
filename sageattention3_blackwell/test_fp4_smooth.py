@@ -77,10 +77,15 @@ def compute_delta_s(qm: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     # qm: [B, H, M, D] where M = num_q_groups
     # k:  [B, H, N, D] where N = seqlen_k
     # output: [B, H, M, N]
-    # Ensure contiguous tensors for matmul
-    qm_f = qm.float().contiguous()
-    k_f = k.float().contiguous()
-    return torch.matmul(qm_f, k_f.transpose(-2, -1))
+    B, H, M, D = qm.shape
+    _, _, N, _ = k.shape
+
+    # Reshape for bmm: [B*H, M, D] @ [B*H, D, N] -> [B*H, M, N]
+    qm_f = qm.float().contiguous().view(B * H, M, D)
+    k_f = k.float().contiguous().view(B * H, N, D).transpose(-2, -1)  # [B*H, D, N]
+
+    result = torch.bmm(qm_f, k_f)  # [B*H, M, N]
+    return result.view(B, H, M, N)
 
 
 def preprocess_smooth(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_mean: bool = True):
