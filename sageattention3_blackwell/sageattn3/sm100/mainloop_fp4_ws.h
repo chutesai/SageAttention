@@ -275,12 +275,17 @@ struct CollectiveMainloopFwdSm100FP4 {
             head_idx * params.stride_Q_head +
             global_row * params.stride_Q_seq;
 
-        // Scale factor strides need adjustment - they're per-block not per-element
-        // SF layout: [batch, heads, seqlen, num_blocks] where num_blocks = HeadDim/16
+        // Scale factor layout is [batch, heads, seqlen, num_sf] where num_sf = HeadDim/16 = 16
+        // SF strides: seq_stride=16, head_stride=seqlen*16, batch_stride=heads*seqlen*16
+        constexpr int NumSF = HeadDim / SFVecSize;  // 16
+        int64_t sf_seq_stride = NumSF;
+        int64_t sf_head_stride = seqlen_q * sf_seq_stride;
+        int64_t sf_batch_stride = (params.stride_Q_batch / params.stride_Q_seq) * sf_head_stride;
+
         ElementSF const* SFQ_base = params.ptr_SFQ +
-            batch_idx * params.stride_Q_batch / SFVecSize +
-            head_idx * params.stride_Q_head / SFVecSize +
-            global_row * params.stride_Q_seq / SFVecSize;
+            batch_idx * sf_batch_stride +
+            head_idx * sf_head_stride +
+            global_row * sf_seq_stride;
 
         // Loop over K/V tiles
         for (int n_tile = 0; n_tile < num_kv_tiles; ++n_tile) {
@@ -312,10 +317,15 @@ struct CollectiveMainloopFwdSm100FP4 {
                     head_idx * params.stride_K_head +
                     global_k * params.stride_K_seq;
 
+                // K scale factors - same layout as Q
+                int64_t sfk_seq_stride = NumSF;
+                int64_t sfk_head_stride = seqlen_k * sfk_seq_stride;
+                int64_t sfk_batch_stride = (params.stride_K_batch / params.stride_K_seq) * sfk_head_stride;
+
                 ElementSF const* SFK_base = params.ptr_SFK +
-                    batch_idx * params.stride_K_batch / SFVecSize +
-                    head_idx * params.stride_K_head / SFVecSize +
-                    global_k * params.stride_K_seq / SFVecSize;
+                    batch_idx * sfk_batch_stride +
+                    head_idx * sfk_head_stride +
+                    global_k * sfk_seq_stride;
 
                 // Block-scaled dot product: sum over blocks
                 // Data is packed: 2 FP4 values per byte, HeadDim/2 bytes per row
@@ -369,10 +379,11 @@ struct CollectiveMainloopFwdSm100FP4 {
                     head_idx * params.stride_V_head +
                     global_k * params.stride_V_seq;
 
+                // V scale factors - same layout as K
                 ElementSF const* SFV_base = params.ptr_SFV +
-                    batch_idx * params.stride_V_batch / SFVecSize +
-                    head_idx * params.stride_V_head / SFVecSize +
-                    global_k * params.stride_V_seq / SFVecSize;
+                    batch_idx * sfk_batch_stride +
+                    head_idx * sfk_head_stride +
+                    global_k * sfk_seq_stride;
 
                 for (int blk = 0; blk < HeadDim / SFVecSize; ++blk) {
                     float sf_v = static_cast<float>(SFV_base[blk]);
