@@ -377,6 +377,74 @@ def verify_smooth_math():
         return False
 
 
+def test_with_biased_inputs(batch=1, heads=1, seqlen=256, head_dim=256, q_bias=0.5, k_bias=0.3, scale_factor=1.0):
+    """Test smooth attention with biased (non-zero mean) inputs.
+
+    This is more representative of real model activations where Q and K
+    have non-zero means, which is where smooth attention actually helps.
+    """
+    print(f"\n{'='*60}")
+    print(f"Testing BIASED INPUTS: q_bias={q_bias}, k_bias={k_bias}, scale={scale_factor}")
+    print('='*60)
+
+    torch.manual_seed(42)
+    # Create inputs with non-zero mean (more realistic)
+    q = (torch.randn(batch, heads, seqlen, head_dim, device='cuda', dtype=torch.bfloat16) + q_bias) * scale_factor
+    k = (torch.randn(batch, heads, seqlen, head_dim, device='cuda', dtype=torch.bfloat16) + k_bias) * scale_factor
+    v = torch.randn(batch, heads, seqlen, head_dim, device='cuda', dtype=torch.bfloat16) * scale_factor
+
+    softmax_scale = 1.0 / (head_dim ** 0.5)
+
+    with torch.no_grad():
+        ref = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+
+    # Test without smooth
+    with torch.no_grad():
+        out_no_smooth = fmha_sm100.fwd_fp4_from_bf16(q, k, v, False, softmax_scale)
+
+    diff_no = (out_no_smooth.float() - ref.float()).abs()
+    max_diff_no = diff_no.max().item()
+    rel_err_no = (diff_no / (ref.float().abs() + 1e-6)).mean().item()
+
+    print(f"NO SMOOTH:")
+    print(f"  Q stats: min={q.min().item():.3f}, max={q.max().item():.3f}, mean={q.mean().item():.3f}")
+    print(f"  K stats: min={k.min().item():.3f}, max={k.max().item():.3f}, mean={k.mean().item():.3f}")
+    print(f"  Max diff: {max_diff_no:.4f}, Rel err: {rel_err_no*100:.2f}%")
+
+    # Test with smooth
+    q_smooth, k_smooth, v_smooth, delta_s = preprocess_smooth(q, k, v, per_block_mean=True)
+    delta_s = delta_s.contiguous().float()
+
+    # Quantize smoothed inputs
+    q_data, q_sf = quantize_bf16_to_fp4(q_smooth)
+    k_data, k_sf = quantize_bf16_to_fp4(k_smooth)
+    v_data, v_sf = quantize_bf16_to_fp4(v_smooth)
+
+    with torch.no_grad():
+        out_smooth = fmha_sm100.fwd_fp4(
+            q_data, q_sf,
+            k_data, k_sf,
+            v_data, v_sf,
+            delta_s,
+            False,
+            softmax_scale
+        )
+
+    diff_smooth = (out_smooth.float() - ref.float()).abs()
+    max_diff_smooth = diff_smooth.max().item()
+    rel_err_smooth = (diff_smooth / (ref.float().abs() + 1e-6)).mean().item()
+
+    print(f"WITH SMOOTH:")
+    print(f"  Q_smooth stats: min={q_smooth.min().item():.3f}, max={q_smooth.max().item():.3f}, mean={q_smooth.mean().item():.3f}")
+    print(f"  K_smooth stats: min={k_smooth.min().item():.3f}, max={k_smooth.max().item():.3f}, mean={k_smooth.mean().item():.3f}")
+    print(f"  Max diff: {max_diff_smooth:.4f}, Rel err: {rel_err_smooth*100:.2f}%")
+
+    improvement = (rel_err_no - rel_err_smooth) / rel_err_no * 100 if rel_err_no > 0 else 0
+    print(f"  Improvement: {improvement:+.1f}%")
+
+    return max_diff_no, rel_err_no, max_diff_smooth, rel_err_smooth
+
+
 def main():
     print("SM100 FP4 Attention Test - Smooth+Delta_s vs No Smooth")
     print("=" * 60)
@@ -393,6 +461,21 @@ def main():
     if not verify_smooth_math():
         print("ERROR: Smooth attention math is incorrect, fix before proceeding!")
         return
+
+    # Test with biased inputs (more realistic - where smooth attention helps)
+    print("\n" + "#"*60)
+    print("# BIASED INPUT TESTS (where smooth attention should help)")
+    print("#"*60)
+
+    biased_results = []
+    for q_bias, k_bias in [(0.5, 0.3), (1.0, 0.8), (2.0, 1.5)]:
+        result = test_with_biased_inputs(q_bias=q_bias, k_bias=k_bias, scale_factor=0.5)
+        biased_results.append((q_bias, k_bias, result))
+
+    # Also test original zero-mean inputs for comparison
+    print("\n" + "#"*60)
+    print("# ZERO-MEAN INPUT TESTS (baseline, smooth may not help)")
+    print("#"*60)
 
     # Compare smooth+delta_s vs no smooth for different scale factors
     results = []
