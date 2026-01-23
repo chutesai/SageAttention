@@ -176,7 +176,33 @@ struct Sm100FlashFwdKernelFP4 {
             params.seqlen_k
         );
 
-        // TODO: Epilogue - write output to GMEM
+        // Epilogue - write output to GMEM
+        // For now, write zeros as a placeholder
+        // The actual implementation will write the accumulated output
+        int thread_idx = threadIdx.x;
+        int row_start = m_block * kBlockM;
+        int rows_this_tile = min(kBlockM, params.seqlen_q - row_start);
+
+        // Each thread writes a portion of the output
+        // Output layout: [batch, heads, seqlen_q, head_dim]
+        ElementOut* ptr_O_base = params.ptr_O +
+            batch_idx * params.stride_O_batch +
+            head_idx * params.stride_O_head +
+            row_start * params.stride_O_seq;
+
+        // Simple epilogue: each thread writes multiple elements
+        constexpr int kElementsPerThread = (kBlockM * kHeadDim) / kNThreads;
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < kElementsPerThread; ++i) {
+            int elem_idx = thread_idx * kElementsPerThread + i;
+            int row = elem_idx / kHeadDim;
+            int col = elem_idx % kHeadDim;
+
+            if (row < rows_this_tile) {
+                ptr_O_base[row * params.stride_O_seq + col] = ElementOut(0.0f);
+            }
+        }
     }
 };
 
