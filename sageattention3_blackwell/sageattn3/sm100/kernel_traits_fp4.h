@@ -237,42 +237,14 @@ struct Flash_fwd_kernel_traits_sm100_fp4 {
     ));
 
     ///////////////////////////////////////////////////////////////////////////
-    // Shared Storage
+    // Shared Storage - Simplified for direct GMEM implementation
+    // Full SMEM/pipeline storage will be needed for TMA-based version
     ///////////////////////////////////////////////////////////////////////////
 
     struct SharedStorage : cute::aligned_struct<128, _0> {
-        // FP4 data tensors
-        cute::array_aligned<ElementData, cute::cosize_v<SmemLayoutQ>> smem_q;
-        union {
-            cute::array_aligned<ElementData, cute::cosize_v<SmemLayoutK>> smem_k;
-            cute::array_aligned<ElementData, cute::cosize_v<SmemLayoutV>> smem_v;
-        };
-
-        // Scale factor tensors
-        cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFA>> smem_sfq;
-        union {
-            cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFB_QK>> smem_sfk;
-            cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFB_PV>> smem_sfv;
-        };
-
-        // Output tensor
-        cute::array_aligned<ElementOut, cute::cosize_v<SmemLayoutO>> smem_o;
-
-        // Pipeline storage
-        struct {
-            alignas(16) typename PipelineQ::SharedStorage pipeline_q;
-            alignas(16) typename PipelineKV::SharedStorage pipeline_kv;
-            alignas(16) typename PipelineS::SharedStorage pipeline_s0;
-            alignas(16) typename PipelineS::SharedStorage pipeline_s1;
-            alignas(16) typename PipelineC::SharedStorage pipeline_c0;
-            alignas(16) typename PipelineC::SharedStorage pipeline_c1;
-            alignas(16) typename PipelineO::SharedStorage pipeline_o;
-            alignas(16) typename PipelineE::SharedStorage pipeline_epi;
-            alignas(16) typename OrderBarrierSoftmax::SharedStorage order_s01;
-        } pipelines;
-
-        // TMEM base pointer
-        uint32_t tmem_base_ptr;
+        // Minimal shared storage for synchronization
+        // The simplified implementation uses direct GMEM access
+        alignas(128) uint32_t sync_flag;
     };
 
     ///////////////////////////////////////////////////////////////////////////
