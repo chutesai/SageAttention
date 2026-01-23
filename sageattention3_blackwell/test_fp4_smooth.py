@@ -209,7 +209,7 @@ def test_smooth_with_delta_s(batch=1, heads=1, seqlen=256, head_dim=256, scale_f
     print(f"FP4+smooth+delta_s vs original:")
     print(f"  Max diff:     {max_diff:.4f}")
     print(f"  Mean diff:    {mean_diff:.4f}")
-    print(f"  Mean rel err: {rel_err:.4f} ({rel_err*100:.2f}%)")
+    print(f"  Mean rel err: {rel_err*100:.2f}%")
     print(f"  Ref mean:     {ref_mean:.4f}")
     print(f"  Out mean:     {out_mean:.4f}")
 
@@ -242,7 +242,7 @@ def test_without_smooth(batch=1, heads=1, seqlen=256, head_dim=256, scale_factor
     rel_err = (diff / (ref.float().abs() + 1e-6)).mean().item()
 
     print(f"  Max diff:     {max_diff:.4f}")
-    print(f"  Mean rel err: {rel_err:.4f} ({rel_err*100:.2f}%)")
+    print(f"  Mean rel err: {rel_err*100:.2f}%")
 
     return max_diff, rel_err
 
