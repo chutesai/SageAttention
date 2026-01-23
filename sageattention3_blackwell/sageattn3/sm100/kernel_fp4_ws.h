@@ -89,6 +89,15 @@ struct Sm100FlashFwdKernelFP4 {
         int64_t stride_O_head;
         int64_t stride_O_batch;
 
+        // Delta-S correction for smooth attention
+        // Shape: [batch, heads, num_q_groups, seqlen_k]
+        float const* ptr_delta_s;
+        int64_t stride_ds_k;
+        int64_t stride_ds_group;
+        int64_t stride_ds_head;
+        int64_t stride_ds_batch;
+        bool use_smooth_attention;
+
         float scale_softmax;
     };
 

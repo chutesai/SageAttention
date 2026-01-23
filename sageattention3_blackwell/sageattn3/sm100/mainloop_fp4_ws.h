@@ -157,6 +157,16 @@ struct CollectiveMainloopFwdSm100FP4 {
         int64_t stride_O_head;
         int64_t stride_O_batch;
 
+        // Delta-S correction for smooth attention
+        // Shape: [batch, heads, num_q_groups, seqlen_k] where num_q_groups = seqlen_q / 128
+        // This corrects for the mean subtraction: S_corrected = S_smooth + delta_s
+        float const* ptr_delta_s;
+        int64_t stride_ds_k;      // stride along K dimension (usually 1)
+        int64_t stride_ds_group;  // stride along Q group dimension (seqlen_k)
+        int64_t stride_ds_head;   // stride along head dimension
+        int64_t stride_ds_batch;  // stride along batch dimension
+        bool use_smooth_attention;  // Whether to apply delta_s correction
+
         float scale_softmax;
         float scale_softmax_log2;
     };
@@ -192,6 +202,14 @@ struct CollectiveMainloopFwdSm100FP4 {
             args.stride_O_seq,
             args.stride_O_head,
             args.stride_O_batch,
+
+            // Delta-S for smooth attention
+            args.ptr_delta_s,
+            args.stride_ds_k,
+            args.stride_ds_group,
+            args.stride_ds_head,
+            args.stride_ds_batch,
+            args.use_smooth_attention,
 
             args.scale_softmax,
             args.scale_softmax * log2_e
@@ -293,6 +311,18 @@ struct CollectiveMainloopFwdSm100FP4 {
             head_idx * sf_head_stride +
             global_row * sf_seq_stride;
 
+        // Delta-S base pointer for smooth attention correction
+        // delta_s shape: [batch, heads, num_q_groups, seqlen_k]
+        // num_q_groups = seqlen_q / 128 (one group per Q block)
+        int q_group_idx = m_block;  // Which Q group this row belongs to
+        float const* delta_s_base = nullptr;
+        if (params.use_smooth_attention && params.ptr_delta_s != nullptr) {
+            delta_s_base = params.ptr_delta_s +
+                batch_idx * params.stride_ds_batch +
+                head_idx * params.stride_ds_head +
+                q_group_idx * params.stride_ds_group;
+        }
+
         // Loop over K/V tiles
         for (int n_tile = 0; n_tile < num_kv_tiles; ++n_tile) {
             int k_start = n_tile * BlockN;
@@ -368,6 +398,15 @@ struct CollectiveMainloopFwdSm100FP4 {
 
                 // Apply softmax scale
                 float s = dot * params.scale_softmax;
+
+                // Apply delta_s correction for smooth attention
+                // This compensates for the mean subtraction during preprocessing:
+                // S_original = (Q - Qm) @ (K - Km)^T + Qm @ K^T
+                //            = S_smooth + delta_s
+                if (delta_s_base != nullptr) {
+                    float ds = delta_s_base[global_k * params.stride_ds_k];
+                    s += ds * params.scale_softmax;
+                }
 
                 // Online softmax update
                 float old_max = row_max;

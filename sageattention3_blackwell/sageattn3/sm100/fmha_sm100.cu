@@ -473,6 +473,7 @@ torch::Tensor run_fmha_fp4_impl(
     torch::Tensor& k_sf,       // [batch, heads, seqlen_k, head_dim/16] scale factors
     torch::Tensor& v_data,     // [batch, heads, seqlen_k, head_dim] FP4 packed
     torch::Tensor& v_sf,       // [batch, heads, seqlen_k, head_dim/16] scale factors
+    torch::Tensor* delta_s,    // Optional: [batch, heads, num_q_groups, seqlen_k] for smooth attention
     float scale
 ) {
     using Kernel = typename FmhaType::Kernel;
@@ -517,6 +518,23 @@ torch::Tensor run_fmha_fp4_impl(
     const int64_t o_head_stride = seqlen_q * o_seq_stride;
     const int64_t o_batch_stride = heads * o_head_stride;
 
+    // Delta-S strides for smooth attention
+    float const* ptr_delta_s = nullptr;
+    int64_t ds_k_stride = 0, ds_group_stride = 0, ds_head_stride = 0, ds_batch_stride = 0;
+    bool use_smooth_attention = false;
+
+    if (delta_s != nullptr && delta_s->defined()) {
+        TORCH_CHECK(delta_s->is_contiguous(), "delta_s must be contiguous");
+        TORCH_CHECK(delta_s->dtype() == torch::kFloat32, "delta_s must be float32");
+        ptr_delta_s = delta_s->data_ptr<float>();
+        // delta_s shape: [batch, heads, num_q_groups, seqlen_k]
+        ds_k_stride = 1;
+        ds_group_stride = seqlen_k;
+        ds_head_stride = delta_s->size(2) * seqlen_k;
+        ds_batch_stride = heads * ds_head_stride;
+        use_smooth_attention = true;
+    }
+
     // Build kernel arguments
     typename Kernel::Arguments args{
         seqlen_q, seqlen_k, head_dim, heads, batch,
@@ -531,6 +549,10 @@ torch::Tensor run_fmha_fp4_impl(
         v_seq_stride, v_head_stride, v_batch_stride,
         reinterpret_cast<ElementFP4Out*>(out.data_ptr()),
         o_seq_stride, o_head_stride, o_batch_stride,
+        // Delta-S for smooth attention
+        ptr_delta_s,
+        ds_k_stride, ds_group_stride, ds_head_stride, ds_batch_stride,
+        use_smooth_attention,
         scale
     };
 
@@ -645,6 +667,7 @@ torch::Tensor fmha_fwd_fp4(
     torch::Tensor k_sf,
     torch::Tensor v_data,
     torch::Tensor v_sf,
+    c10::optional<torch::Tensor> delta_s,  // Optional smooth attention correction
     bool is_causal,
     float scale
 ) {
@@ -657,12 +680,20 @@ torch::Tensor fmha_fwd_fp4(
 
     at::cuda::CUDAGuard device_guard(q_data.device());
 
+    // Handle optional delta_s
+    torch::Tensor* delta_s_ptr = nullptr;
+    torch::Tensor delta_s_tensor;
+    if (delta_s.has_value()) {
+        delta_s_tensor = delta_s.value();
+        delta_s_ptr = &delta_s_tensor;
+    }
+
     if (is_causal) {
         return run_fmha_fp4_impl<FmhaFP4Causal>(
-            q_data, q_sf, k_data, k_sf, v_data, v_sf, scale);
+            q_data, q_sf, k_data, k_sf, v_data, v_sf, delta_s_ptr, scale);
     }
     return run_fmha_fp4_impl<FmhaFP4NoMask>(
-        q_data, q_sf, k_data, k_sf, v_data, v_sf, scale);
+        q_data, q_sf, k_data, k_sf, v_data, v_sf, delta_s_ptr, scale);
 }
 
 // Auto-quantize BF16 to FP4 and run FP4 attention
@@ -767,8 +798,8 @@ torch::Tensor fmha_fwd_fp4_from_bf16(
     auto v_odd = v_int.index({"...", torch::indexing::Slice(1, torch::indexing::None, 2)});
     auto v_data = ((v_even & 0x0F) | ((v_odd & 0x0F) * 16)).to(torch::kUInt8);
 
-    // Run FP4 attention
-    auto out_padded = fmha_fwd_fp4(q_data, q_sf, k_data, k_sf, v_data, v_sf, is_causal, scale);
+    // Run FP4 attention (no smooth attention in this path)
+    auto out_padded = fmha_fwd_fp4(q_data, q_sf, k_data, k_sf, v_data, v_sf, c10::nullopt, is_causal, scale);
 
     // Remove padding if we added it
     if (head_dim < 256) {
@@ -803,10 +834,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // FP4 functions - 7x theoretical tensor core throughput (requires HeadDim=256)
     m.def("fwd_fp4", &fmha_fwd_fp4,
           "SM100 Flash MHA Forward (FP4 block-scaled, 7x theoretical speedup)\n"
-          "NOTE: Requires HeadDim=256, input must be pre-quantized FP4 with scale factors",
+          "NOTE: Requires HeadDim=256, input must be pre-quantized FP4 with scale factors\n"
+          "delta_s: Optional smooth attention correction tensor [batch, heads, num_q_groups, seqlen_k]",
           py::arg("q_data"), py::arg("q_sf"),
           py::arg("k_data"), py::arg("k_sf"),
           py::arg("v_data"), py::arg("v_sf"),
+          py::arg("delta_s") = py::none(),
           py::arg("is_causal") = false, py::arg("scale") = 1.0f);
     m.def("fwd_fp4_from_bf16", &fmha_fwd_fp4_from_bf16,
           "SM100 Flash MHA Forward (auto-quantize BF16->FP4, 7x theoretical speedup)\n"
