@@ -80,12 +80,11 @@ def compute_delta_s(qm: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     B, H, M, D = qm.shape
     _, _, N, _ = k.shape
 
-    # Reshape for bmm: [B*H, M, D] @ [B*H, D, N] -> [B*H, M, N]
-    qm_f = qm.float().contiguous().view(B * H, M, D)
-    k_f = k.float().contiguous().view(B * H, N, D).transpose(-2, -1)  # [B*H, D, N]
-
-    result = torch.bmm(qm_f, k_f)  # [B*H, M, N]
-    return result.view(B, H, M, N)
+    # Do computation on CPU then move back to avoid CUBLAS issues
+    qm_cpu = qm.float().cpu()
+    k_cpu = k.float().cpu()
+    result_cpu = torch.matmul(qm_cpu, k_cpu.transpose(-2, -1))
+    return result_cpu.to(qm.device)
 
 
 def preprocess_smooth(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_mean: bool = True):
