@@ -252,17 +252,18 @@ def test_without_smooth(batch=1, heads=1, seqlen=256, head_dim=256, scale_factor
 
 
 def verify_smooth_math():
-    """Verify that smooth attention math is correct in pure PyTorch."""
+    """Verify that smooth attention math is correct in pure PyTorch (on CPU)."""
     print("\n" + "="*60)
-    print("VERIFICATION: Smooth attention math in pure PyTorch")
+    print("VERIFICATION: Smooth attention math in pure PyTorch (CPU)")
     print("="*60)
 
     batch, heads, seqlen, head_dim = 1, 1, 256, 256
 
     torch.manual_seed(42)
-    q = torch.randn(batch, heads, seqlen, head_dim, device='cuda', dtype=torch.float32)
-    k = torch.randn(batch, heads, seqlen, head_dim, device='cuda', dtype=torch.float32)
-    v = torch.randn(batch, heads, seqlen, head_dim, device='cuda', dtype=torch.float32)
+    # Run on CPU to avoid CUBLAS issues
+    q = torch.randn(batch, heads, seqlen, head_dim, dtype=torch.float32)
+    k = torch.randn(batch, heads, seqlen, head_dim, dtype=torch.float32)
+    v = torch.randn(batch, heads, seqlen, head_dim, dtype=torch.float32)
 
     softmax_scale = 1.0 / (head_dim ** 0.5)
 
