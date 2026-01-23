@@ -183,6 +183,10 @@ def test_smooth_with_delta_s(batch=1, heads=1, seqlen=256, head_dim=256, scale_f
     delta_s = delta_s.contiguous().float()
 
     print(f"delta_s shape: {delta_s.shape}")  # [batch, heads, num_q_groups, seqlen_k]
+    print(f"delta_s stats: min={delta_s.min().item():.4f}, max={delta_s.max().item():.4f}, mean={delta_s.mean().item():.4f}")
+
+    # Debug: Show first few delta_s values
+    print(f"delta_s[0,0,0,:5]: {delta_s[0,0,0,:5].tolist()}")
 
     # Run FP4 kernel with smooth inputs AND delta_s correction
     with torch.no_grad():
@@ -247,6 +251,62 @@ def test_without_smooth(batch=1, heads=1, seqlen=256, head_dim=256, scale_factor
     return max_diff, rel_err
 
 
+def verify_smooth_math():
+    """Verify that smooth attention math is correct in pure PyTorch."""
+    print("\n" + "="*60)
+    print("VERIFICATION: Smooth attention math in pure PyTorch")
+    print("="*60)
+
+    batch, heads, seqlen, head_dim = 1, 1, 256, 256
+
+    torch.manual_seed(42)
+    q = torch.randn(batch, heads, seqlen, head_dim, device='cuda', dtype=torch.float32)
+    k = torch.randn(batch, heads, seqlen, head_dim, device='cuda', dtype=torch.float32)
+    v = torch.randn(batch, heads, seqlen, head_dim, device='cuda', dtype=torch.float32)
+
+    softmax_scale = 1.0 / (head_dim ** 0.5)
+
+    # Original attention scores: S = Q @ K^T * scale
+    S_orig = torch.matmul(q, k.transpose(-2, -1)) * softmax_scale
+
+    # Smooth Q and K
+    k_smooth = k - k.mean(dim=-2, keepdim=True)
+
+    # Per-block (128) Q mean subtraction
+    GROUP_SIZE = 128
+    q_reshaped = q.view(batch, heads, seqlen // GROUP_SIZE, GROUP_SIZE, head_dim)
+    qm = q_reshaped.mean(dim=3)  # [batch, heads, num_groups, head_dim]
+    q_smooth = q - qm.unsqueeze(3).expand_as(q_reshaped).reshape(batch, heads, seqlen, head_dim)
+
+    # Smooth attention scores: S_smooth = Q_smooth @ K_smooth^T * scale
+    S_smooth = torch.matmul(q_smooth, k_smooth.transpose(-2, -1)) * softmax_scale
+
+    # Delta-S correction: delta_s = Qm @ K_smooth^T * scale
+    # Shape: [batch, heads, num_groups, seqlen_k]
+    delta_s = torch.matmul(qm, k_smooth.transpose(-2, -1)) * softmax_scale
+
+    # Expand delta_s to match S shape
+    # Each delta_s[g] applies to rows [g*128 : (g+1)*128]
+    delta_s_expanded = delta_s.unsqueeze(3).expand(batch, heads, seqlen // GROUP_SIZE, GROUP_SIZE, seqlen)
+    delta_s_expanded = delta_s_expanded.reshape(batch, heads, seqlen, seqlen)
+
+    # Reconstructed: S_reconstructed = S_smooth + delta_s
+    S_reconstructed = S_smooth + delta_s_expanded
+
+    # Compare
+    diff = (S_orig - S_reconstructed).abs()
+    print(f"S_orig vs S_smooth+delta_s:")
+    print(f"  Max diff:  {diff.max().item():.6f}")
+    print(f"  Mean diff: {diff.mean().item():.6f}")
+
+    if diff.max().item() < 1e-5:
+        print("  PASS: Smooth attention math is correct!")
+    else:
+        print("  FAIL: There's an error in the smooth attention math!")
+
+    return diff.max().item() < 1e-5
+
+
 def main():
     print("SM100 FP4 Attention Test - Smooth+Delta_s vs No Smooth")
     print("=" * 60)
@@ -258,6 +318,11 @@ def main():
     props = torch.cuda.get_device_properties(0)
     print(f"GPU: {props.name}")
     print(f"Compute capability: {props.major}.{props.minor}")
+
+    # First verify the math is correct
+    if not verify_smooth_math():
+        print("ERROR: Smooth attention math is incorrect, fix before proceeding!")
+        return
 
     # Compare smooth+delta_s vs no smooth for different scale factors
     results = []
