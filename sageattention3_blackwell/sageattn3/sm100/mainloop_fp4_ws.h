@@ -5,7 +5,7 @@
  * SM100 (B200/B300) FP4 Block-Scaled Mainloop for FlashAttention.
  *
  * This implements FP4 attention using SM100's block-scaled tcgen05.mma
- * instructions. Uses CUTLASS CollectiveMma for the GEMM operations.
+ * instructions. Uses CUTLASS CollectiveMma infrastructure.
  *
  * Key constraints:
  * - HeadDim = 256 (FP4 MMA K=256 requirement)
@@ -32,10 +32,40 @@ namespace flash {
 using namespace cute;
 
 ///////////////////////////////////////////////////////////////////////////////
+// Causal mask for FP4 attention
+///////////////////////////////////////////////////////////////////////////////
+
+struct CausalMaskFP4 {
+    template <typename BlkCoord, typename TileShape, typename ProblemShape>
+    CUTLASS_DEVICE int get_trip_count(
+        BlkCoord const& blk_coord,
+        TileShape tile_shape,
+        ProblemShape const& problem_shape
+    ) const {
+        int seqlen_k = get<1>(problem_shape);
+        int block_n = get<1>(tile_shape);
+        int block_m = get<0>(tile_shape);
+        int m_idx = get<0>(blk_coord);
+        int max_k = min(seqlen_k, (m_idx + 1) * block_m);
+        return (max_k + block_n - 1) / block_n;
+    }
+};
+
+struct NoMaskFP4 {
+    template <typename BlkCoord, typename TileShape, typename ProblemShape>
+    CUTLASS_DEVICE int get_trip_count(
+        BlkCoord const& blk_coord,
+        TileShape tile_shape,
+        ProblemShape const& problem_shape
+    ) const {
+        int seqlen_k = get<1>(problem_shape);
+        int block_n = get<1>(tile_shape);
+        return (seqlen_k + block_n - 1) / block_n;
+    }
+};
+
+///////////////////////////////////////////////////////////////////////////////
 // SM100 FP4 Block-Scaled Flash Attention Mainloop
-//
-// Uses CUTLASS's CollectiveMma infrastructure for block-scaled GEMM.
-// The mainloop coordinates TMA loads and MMA execution for attention.
 ///////////////////////////////////////////////////////////////////////////////
 
 template <typename Ktraits, bool Is_causal>
@@ -61,6 +91,24 @@ struct CollectiveMainloopFwdSm100FP4 {
     using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
     using SmemLayoutK = typename Ktraits::SmemLayoutK;
     using SmemLayoutV = typename Ktraits::SmemLayoutV;
+    using SmemLayoutSFA = typename Ktraits::SmemLayoutSFA;
+    using SmemLayoutSFB_QK = typename Ktraits::SmemLayoutSFB_QK;
+    using SmemLayoutSFB_PV = typename Ktraits::SmemLayoutSFB_PV;
+
+    // TMA types from CollectiveBuilder
+    using TMA_Q = typename Ktraits::TMA_Q;
+    using TMA_K = typename Ktraits::TMA_K;
+    using TMA_V = typename Ktraits::TMA_V;
+    using TMA_SFA = typename Ktraits::TMA_SFA;
+    using TMA_SFB = typename Ktraits::TMA_SFB;
+    using TMA_SFV = typename Ktraits::TMA_SFV;
+
+    // Strides
+    using StrideQ = typename Ktraits::StrideQ;
+    using StrideK = typename Ktraits::StrideK;
+    using StrideV = typename Ktraits::StrideV;
+    using LayoutSFA = typename Ktraits::LayoutSFA;
+    using LayoutSFB = typename Ktraits::LayoutSFB;
 
     static constexpr int kBlockM = Ktraits::kBlockM;
     static constexpr int kBlockN = Ktraits::kBlockN;
@@ -70,35 +118,28 @@ struct CollectiveMainloopFwdSm100FP4 {
     // Scale factor configuration
     static constexpr int kSFVectorSize = Ktraits::SFVectorSize;
 
-    // Pipeline stages
-    static constexpr int kStagesQ = Ktraits::kStageCountQ;
-    static constexpr int kStagesKV = Ktraits::kStageCountKV;
+    // Mask type
+    using Mask = std::conditional_t<Is_causal, CausalMaskFP4, NoMaskFP4>;
 
     ///////////////////////////////////////////////////////////////////////////
     // Parameters
     ///////////////////////////////////////////////////////////////////////////
 
     struct Params {
-        // Q tensor and scale factors
-        ElementData const* ptr_Q;
-        ElementSF const* ptr_SFQ;
-        int64_t stride_Q_seq;
-        int64_t stride_Q_head;
-        int64_t stride_Q_batch;
+        // TMA descriptors for data
+        TMA_Q tma_load_q;
+        TMA_K tma_load_k;
+        TMA_V tma_load_v;
 
-        // K tensor and scale factors
-        ElementData const* ptr_K;
-        ElementSF const* ptr_SFK;
-        int64_t stride_K_seq;
-        int64_t stride_K_head;
-        int64_t stride_K_batch;
+        // TMA descriptors for scale factors
+        TMA_SFA tma_load_sfq;
+        TMA_SFB tma_load_sfk;
+        TMA_SFV tma_load_sfv;
 
-        // V tensor and scale factors
-        ElementData const* ptr_V;
-        ElementSF const* ptr_SFV;
-        int64_t stride_V_seq;
-        int64_t stride_V_head;
-        int64_t stride_V_batch;
+        // Scale factor layouts
+        LayoutSFA layout_sfq;
+        LayoutSFB layout_sfk;
+        LayoutSFB layout_sfv;
 
         float scale_softmax;
         float scale_softmax_log2;
@@ -111,22 +152,21 @@ struct CollectiveMainloopFwdSm100FP4 {
     ) {
         float log2_e = static_cast<float>(M_LOG2E);
 
+        // For now, return a minimal Params struct
+        // The actual TMA descriptor construction requires problem shape info
+        // which we don't have here. This will be set up properly when we
+        // integrate with the full kernel infrastructure.
+
         return Params{
-            args.ptr_Q,
-            args.ptr_SFQ,
-            args.stride_Q_seq,
-            args.stride_Q_head,
-            args.stride_Q_batch,
-            args.ptr_K,
-            args.ptr_SFK,
-            args.stride_K_seq,
-            args.stride_K_head,
-            args.stride_K_batch,
-            args.ptr_V,
-            args.ptr_SFV,
-            args.stride_V_seq,
-            args.stride_V_head,
-            args.stride_V_batch,
+            TMA_Q{},
+            TMA_K{},
+            TMA_V{},
+            TMA_SFA{},
+            TMA_SFB{},
+            TMA_SFV{},
+            LayoutSFA{},
+            LayoutSFB{},
+            LayoutSFB{},
             args.scale_softmax,
             args.scale_softmax * log2_e
         };
@@ -150,104 +190,45 @@ struct CollectiveMainloopFwdSm100FP4 {
         int warp_idx = thread_idx / 32;
         int lane_idx = thread_idx % 32;
 
-        // Calculate number of K/V tiles to process
-        int num_kv_tiles = (seqlen_k + kBlockN - 1) / kBlockN;
+        // Problem shape for this tile
+        auto problem_shape = make_tuple(seqlen_q, seqlen_k, kHeadDim,
+                                        make_tuple(1, 1));  // heads, batch handled externally
 
-        // For causal masking, reduce tile count based on Q position
-        if constexpr (Is_causal) {
-            int q_start = m_block * kBlockM;
-            int max_k_tile = (q_start + kBlockM + kBlockN - 1) / kBlockN;
-            num_kv_tiles = min(num_kv_tiles, max_k_tile);
-        }
+        // Calculate number of K/V tiles to process
+        Mask mask;
+        auto blk_coord = make_tuple(m_block, 0, make_tuple(head_idx, batch_idx));
+        int num_kv_tiles = mask.get_trip_count(blk_coord, TileShapeQK{}, problem_shape);
 
         // Early exit if no tiles to process
         if (num_kv_tiles <= 0) return;
-
-        // Calculate base pointers for this head/batch
-        ElementData const* ptr_Q = params.ptr_Q +
-            batch_idx * params.stride_Q_batch +
-            head_idx * params.stride_Q_head +
-            m_block * kBlockM * params.stride_Q_seq;
-
-        ElementSF const* ptr_SFQ = params.ptr_SFQ +
-            batch_idx * (params.stride_Q_batch / kSFVectorSize) +
-            head_idx * (params.stride_Q_head / kSFVectorSize) +
-            m_block * kBlockM * (params.stride_Q_seq / kSFVectorSize);
 
         // Create SMEM tensors
         Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(storage.smem_k.data()), SmemLayoutK{});
         Tensor sV = make_tensor(make_smem_ptr(storage.smem_v.data()), SmemLayoutV{});
 
-        // Initialize output accumulator in registers
-        // Each thread owns a portion of the M x HeadDim output
-        constexpr int kAccumRows = kBlockM / kNThreads * 32;  // Rows per thread
-        float acc_O[kAccumRows][kHeadDim / 32];  // Simplified accumulator
+        // Create SMEM tensors for scale factors
+        Tensor sSFQ = make_tensor(make_smem_ptr(storage.smem_sfq.data()), SmemLayoutSFA{});
+        Tensor sSFK = make_tensor(make_smem_ptr(storage.smem_sfk.data()), SmemLayoutSFB_QK{});
+        Tensor sSFV = make_tensor(make_smem_ptr(storage.smem_sfv.data()), SmemLayoutSFB_PV{});
 
-        // Initialize accumulators to zero
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < kAccumRows; ++i) {
-            CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < kHeadDim / 32; ++j) {
-                acc_O[i][j] = 0.0f;
-            }
-        }
-
-        // Online softmax state
-        float row_max = -INFINITY;
-        float row_sum = 0.0f;
-
-        // Main attention loop
-        // For a complete implementation, we would:
-        // 1. Use TMA to load Q tile (once)
-        // 2. For each K/V tile:
-        //    a. TMA load K and scale factors
-        //    b. Execute QK GEMM using CollectiveMmaQK
+        // The full implementation would:
+        // 1. Set up TMA tensors using params.tma_load_*.get_tma_tensor()
+        // 2. Partition with tma_partition()
+        // 3. Load Q and its scale factors via TMA
+        // 4. For each K/V tile:
+        //    a. Load K, K scale factors via TMA
+        //    b. Execute QK block-scaled GEMM
         //    c. Apply softmax scaling
-        //    d. Compute online softmax (max, exp, sum)
-        //    e. Quantize P to FP4 (generate scale factors on-the-fly)
-        //    f. TMA load V and scale factors
-        //    g. Execute PV GEMM using CollectiveMmaPV
-        //    h. Apply softmax correction to accumulator
-        // 3. Normalize output and write to GMEM
+        //    d. Compute online softmax
+        //    e. Quantize P to FP4 (on-the-fly scale factor generation)
+        //    f. Load V, V scale factors via TMA
+        //    g. Execute PV block-scaled GEMM
+        //    h. Correct output accumulator
+        // 5. Normalize and write output
 
-        // For now, this is a minimal implementation that ensures
-        // the kernel structure is correct. The actual GEMM operations
-        // require careful integration with CUTLASS's CollectiveMma.
-
+        // For now, this is a placeholder that ensures compilation
         __syncthreads();
-
-        // The full implementation would use the following pattern:
-        //
-        // // Get TiledMma for QK
-        // TiledMmaQK mma_qk;
-        // auto thr_mma_qk = mma_qk.get_slice(thread_idx);
-        //
-        // // Create register fragments
-        // Tensor tSrQ = thr_mma_qk.make_fragment_A(sQ);
-        // Tensor tSrK = thr_mma_qk.make_fragment_B(sK);
-        // Tensor tStS = partition_fragment_C(mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
-        //
-        // // For each K tile:
-        // for (int kv_tile = 0; kv_tile < num_kv_tiles; ++kv_tile) {
-        //     // Load K tile via TMA
-        //     // ...
-        //
-        //     // Execute QK GEMM
-        //     cute::gemm(mma_qk, tSrQ, tSrK, tStS);
-        //
-        //     // Apply softmax (scale, max, exp, sum)
-        //     // ...
-        //
-        //     // Quantize P to FP4
-        //     // ...
-        //
-        //     // Load V tile via TMA
-        //     // ...
-        //
-        //     // Execute PV GEMM
-        //     // ...
-        // }
     }
 };
 
