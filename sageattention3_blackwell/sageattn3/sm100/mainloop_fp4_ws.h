@@ -19,6 +19,8 @@
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_conversion.h"
+#include "cutlass/float_subbyte.h"
+#include "cutlass/float8.h"
 
 #include "kernel_traits_fp4.h"
 
@@ -116,18 +118,24 @@ struct CollectiveMainloopFwdSm100FP4 {
 
     // Helper to decode FP4 E2M1 nibble to float
     // E2M1 format: 1 sign bit, 2 exponent bits, 1 mantissa bit
-    // Values: 0, 0.5, 1, 1.5, 2, 3, 4, 6 (and negatives)
-    // Nibble layout: S EE M where S=sign, EE=exponent, M=mantissa
+    // Nibble: SEEM (S=sign, E=exponent, M=mantissa)
+    // Exponent bias = 1
+    //
+    // Values computed from IEEE-like formula:
+    // exp=00 (denorm): value = 0.M * 2^(1-bias) = 0.M * 2^0 = 0.M
+    // exp=01: value = 1.M * 2^(1-bias) = 1.M * 2^0 = 1.M
+    // exp=10: value = 1.M * 2^(2-bias) = 1.M * 2^1 = 2*(1.M)
+    // exp=11: value = 1.M * 2^(3-bias) = 1.M * 2^2 = 4*(1.M)
+    //
+    // Positive values (nibbles 0-7): 0, 0.5, 1, 1.5, 2, 3, 4, 6
+    // Negative values (nibbles 8-15): -0, -0.5, -1, -1.5, -2, -3, -4, -6
     CUTLASS_DEVICE static float decode_fp4_e2m1(uint8_t nibble) {
-        // E2M1 lookup table for positive values (nibbles 0-7)
-        // 0b000 = 0, 0b001 = 0.5, 0b010 = 1, 0b011 = 1.5
-        // 0b100 = 2, 0b101 = 3,   0b110 = 4, 0b111 = 6
-        constexpr float e2m1_lut[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-
-        bool sign = (nibble >> 3) & 1;
-        uint8_t magnitude = nibble & 0x7;
-        float value = e2m1_lut[magnitude];
-        return sign ? -value : value;
+        // Full 16-entry LUT including negative values
+        constexpr float e2m1_lut[16] = {
+            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,   // positive (0-7)
+            -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f  // negative (8-15)
+        };
+        return e2m1_lut[nibble & 0x0F];
     }
 
     struct Params {
@@ -336,11 +344,17 @@ struct CollectiveMainloopFwdSm100FP4 {
 
                 // Block-scaled dot product: sum over blocks
                 // Data is packed: 2 FP4 values per byte, HeadDim/2 bytes per row
+                //
+                // DEBUG: Scale factor layout is complex (permuted), so for now
+                // read scale factors as raw bytes and convert manually
                 float dot = 0.0f;
                 for (int blk = 0; blk < HeadDim / SFVecSize; ++blk) {
                     // Get scale factors for this block
-                    float sf_q = static_cast<float>(SFQ_base[blk]);
-                    float sf_k = static_cast<float>(SFK_base[blk]);
+                    // Read as raw bytes and convert using CUTLASS's type
+                    uint8_t sf_q_raw = reinterpret_cast<uint8_t const*>(SFQ_base)[blk];
+                    uint8_t sf_k_raw = reinterpret_cast<uint8_t const*>(SFK_base)[blk];
+                    float sf_q = static_cast<float>(cutlass::float_e4m3_t::bitcast(sf_q_raw));
+                    float sf_k = static_cast<float>(cutlass::float_e4m3_t::bitcast(sf_k_raw));
                     float scale = sf_q * sf_k;
 
                     // Dot product within block (16 FP4 values = 8 packed bytes)
@@ -393,7 +407,8 @@ struct CollectiveMainloopFwdSm100FP4 {
                     global_k * sfk_seq_stride;
 
                 for (int blk = 0; blk < HeadDim / SFVecSize; ++blk) {
-                    float sf_v = static_cast<float>(SFV_base[blk]);
+                    uint8_t sf_v_raw = reinterpret_cast<uint8_t const*>(SFV_base)[blk];
+                    float sf_v = static_cast<float>(cutlass::float_e4m3_t::bitcast(sf_v_raw));
                     for (int i = 0; i < SFVecSize; i += 2) {
                         int byte_idx = (blk * SFVecSize + i) / 2;
                         uint8_t v_packed = V_base[byte_idx];

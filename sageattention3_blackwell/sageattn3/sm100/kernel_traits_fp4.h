@@ -84,9 +84,9 @@ struct Flash_fwd_kernel_traits_sm100_fp4 {
     static constexpr int kStageCountKV = kStages_;
 
     // Element types for FP4 block-scaled attention
-    // NVF4 format: FP4 data (e2m1) with FP8 UE4M3 scale factors, vector size 16
+    // NVF4 format: FP4 data (e2m1) with FP8 E4M3 scale factors, vector size 16
     using ElementData = cutlass::float_e2m1_t;           // FP4 data type
-    using ElementSF = cutlass::float_ue4m3_t;            // FP8 E4M3 unsigned scale factors
+    using ElementSF = cutlass::float_e4m3_t;             // FP8 E4M3 scale factors (matches PyTorch float8_e4m3fn)
     using Element = cutlass::nv_float4_t<ElementData>;   // NVF4 packed type with scales
     using ElementAccum = float;
     using ElementOut = ElementOut_;
