@@ -181,8 +181,10 @@ struct Flash_fwd_kernel_traits_sm100_fp4 {
     // Warp Configuration - simplified for initial implementation
     ///////////////////////////////////////////////////////////////////////////
 
-    // Use standard warp-specialized layout from CUTLASS
-    static constexpr int kNWarps = 16;
+    // For simplified direct GMEM version: 128 threads = 128 rows (one thread per row)
+    // Each thread needs HeadDim floats = 256 * 4 = 1024 bytes = 256 registers
+    // With 128 threads per block, this should fit in SM100's register file
+    static constexpr int kNWarps = 4;  // 128 threads
     static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
     static constexpr int kClusterM = kClusterM_;
 
