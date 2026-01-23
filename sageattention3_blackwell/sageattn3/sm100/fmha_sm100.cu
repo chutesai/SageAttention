@@ -312,8 +312,8 @@ torch::Tensor run_fmha_fp8_impl(
     TORCH_CHECK(k.is_contiguous(), "K must be contiguous");
     TORCH_CHECK(v.is_contiguous(), "V must be contiguous");
 
-    // Output is FP8 as well
-    auto out = torch::empty_like(q);
+    // Output is FP16 (half) for FP8 attention (per CUTLASS example 77)
+    auto out = torch::empty({batch, heads, seqlen_q, head_dim}, q.options().dtype(torch::kFloat16));
 
     const int h_groups = 1;
     const int h_per_group = heads;
@@ -373,7 +373,7 @@ torch::Tensor run_fmha_fp8_impl(
             1.0f        // inv_scale_o (output is FP8, will need requantization)
         },
         {
-            reinterpret_cast<ElementFP8*>(out.data_ptr()),
+            reinterpret_cast<ElementFP8Out*>(out.data_ptr()),
             stride_O,
             reinterpret_cast<float*>(lse.data_ptr()),
             stride_LSE
