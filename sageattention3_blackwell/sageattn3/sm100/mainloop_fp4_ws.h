@@ -204,11 +204,17 @@ struct CollectiveMainloopFwdSm100FP4 {
         int seqlen_k
     ) {
         int thread_idx = threadIdx.x;
-        int warp_idx = thread_idx / 32;
-        int lane_idx = thread_idx % 32;
+        (void)thread_idx;  // Used below
+
+        // Use local constants to avoid device code issues with class static members
+        constexpr int BlockM = Ktraits::kBlockM;
+        constexpr int BlockN = Ktraits::kBlockN;
+        constexpr int HeadDim = Ktraits::kHeadDim;
+        constexpr int NThreads = Ktraits::kNThreads;
+        constexpr int SFVecSize = Ktraits::SFVectorSize;
 
         // Problem shape for this tile
-        auto problem_shape = make_tuple(seqlen_q, seqlen_k, kHeadDim,
+        auto problem_shape = make_tuple(seqlen_q, seqlen_k, HeadDim,
                                         make_tuple(1, 1));
 
         // Calculate number of K/V tiles to process
@@ -220,8 +226,8 @@ struct CollectiveMainloopFwdSm100FP4 {
         if (num_kv_tiles <= 0) return;
 
         // Row start in Q for this block
-        int row_start = m_block * kBlockM;
-        int rows_this_tile = min(kBlockM, seqlen_q - row_start);
+        int row_start = m_block * BlockM;
+        int rows_this_tile = min(BlockM, seqlen_q - row_start);
 
         // =====================================================================
         // SIMPLIFIED FP4 ATTENTION IMPLEMENTATION
@@ -230,13 +236,12 @@ struct CollectiveMainloopFwdSm100FP4 {
         // =====================================================================
 
         // Per-thread accumulator for output (FP32)
-        // Each thread handles a subset of the output elements
-        constexpr int kRowsPerThread = kBlockM / kNThreads * kHeadDim;
-        float thread_output[kHeadDim];  // One row per thread for simplicity
+        // Each thread handles one row
+        float thread_output[HeadDim];
 
         // Initialize output to zero
         CUTLASS_PRAGMA_UNROLL
-        for (int d = 0; d < kHeadDim; ++d) {
+        for (int d = 0; d < HeadDim; ++d) {
             thread_output[d] = 0.0f;
         }
 
@@ -245,7 +250,7 @@ struct CollectiveMainloopFwdSm100FP4 {
         float row_sum = 0.0f;
 
         // Which row does this thread handle
-        int my_row = thread_idx % kBlockM;
+        int my_row = thread_idx % BlockM;
         int global_row = row_start + my_row;
 
         if (my_row >= rows_this_tile) {
@@ -261,14 +266,14 @@ struct CollectiveMainloopFwdSm100FP4 {
             global_row * params.stride_Q_seq;
 
         ElementSF const* SFQ_base = params.ptr_SFQ +
-            batch_idx * params.stride_Q_batch / kSFVectorSize +
-            head_idx * params.stride_Q_head / kSFVectorSize +
-            global_row * params.stride_Q_seq / kSFVectorSize;
+            batch_idx * params.stride_Q_batch / SFVecSize +
+            head_idx * params.stride_Q_head / SFVecSize +
+            global_row * params.stride_Q_seq / SFVecSize;
 
         // Loop over K/V tiles
         for (int n_tile = 0; n_tile < num_kv_tiles; ++n_tile) {
-            int k_start = n_tile * kBlockN;
-            int cols_this_tile = min(kBlockN, seqlen_k - k_start);
+            int k_start = n_tile * BlockN;
+            int cols_this_tile = min(BlockN, seqlen_k - k_start);
 
             // For causal: check if this K tile has any valid positions
             if constexpr (Is_causal) {
@@ -296,21 +301,21 @@ struct CollectiveMainloopFwdSm100FP4 {
                     global_k * params.stride_K_seq;
 
                 ElementSF const* SFK_base = params.ptr_SFK +
-                    batch_idx * params.stride_K_batch / kSFVectorSize +
-                    head_idx * params.stride_K_head / kSFVectorSize +
-                    global_k * params.stride_K_seq / kSFVectorSize;
+                    batch_idx * params.stride_K_batch / SFVecSize +
+                    head_idx * params.stride_K_head / SFVecSize +
+                    global_k * params.stride_K_seq / SFVecSize;
 
                 // Block-scaled dot product: sum over blocks
                 float dot = 0.0f;
-                for (int blk = 0; blk < kHeadDim / kSFVectorSize; ++blk) {
+                for (int blk = 0; blk < HeadDim / SFVecSize; ++blk) {
                     // Get scale factors for this block
                     float sf_q = static_cast<float>(SFQ_base[blk]);
                     float sf_k = static_cast<float>(SFK_base[blk]);
                     float scale = sf_q * sf_k;
 
                     // Dot product within block (FP4 values)
-                    for (int i = 0; i < kSFVectorSize; ++i) {
-                        int idx = blk * kSFVectorSize + i;
+                    for (int i = 0; i < SFVecSize; ++i) {
+                        int idx = blk * SFVecSize + i;
                         float q_val = static_cast<float>(Q_base[idx]);
                         float k_val = static_cast<float>(K_base[idx]);
                         dot += q_val * k_val * scale;
@@ -328,7 +333,7 @@ struct CollectiveMainloopFwdSm100FP4 {
 
                 // Correct previous output accumulator
                 CUTLASS_PRAGMA_UNROLL
-                for (int d = 0; d < kHeadDim; ++d) {
+                for (int d = 0; d < HeadDim; ++d) {
                     thread_output[d] *= correction;
                 }
 
@@ -343,14 +348,14 @@ struct CollectiveMainloopFwdSm100FP4 {
                     global_k * params.stride_V_seq;
 
                 ElementSF const* SFV_base = params.ptr_SFV +
-                    batch_idx * params.stride_V_batch / kSFVectorSize +
-                    head_idx * params.stride_V_head / kSFVectorSize +
-                    global_k * params.stride_V_seq / kSFVectorSize;
+                    batch_idx * params.stride_V_batch / SFVecSize +
+                    head_idx * params.stride_V_head / SFVecSize +
+                    global_k * params.stride_V_seq / SFVecSize;
 
-                for (int blk = 0; blk < kHeadDim / kSFVectorSize; ++blk) {
+                for (int blk = 0; blk < HeadDim / SFVecSize; ++blk) {
                     float sf_v = static_cast<float>(SFV_base[blk]);
-                    for (int i = 0; i < kSFVectorSize; ++i) {
-                        int d = blk * kSFVectorSize + i;
+                    for (int i = 0; i < SFVecSize; ++i) {
+                        int d = blk * SFVecSize + i;
                         float v_val = static_cast<float>(V_base[d]) * sf_v;
                         thread_output[d] += p * v_val;
                     }
@@ -362,7 +367,7 @@ struct CollectiveMainloopFwdSm100FP4 {
         if (row_sum > 0.0f) {
             float inv_sum = 1.0f / row_sum;
             CUTLASS_PRAGMA_UNROLL
-            for (int d = 0; d < kHeadDim; ++d) {
+            for (int d = 0; d < HeadDim; ++d) {
                 thread_output[d] *= inv_sum;
             }
         }
@@ -370,14 +375,14 @@ struct CollectiveMainloopFwdSm100FP4 {
         __syncthreads();
 
         // Write output to GMEM
-        // Each thread writes one row (thread_idx % kBlockM)
+        // Each thread writes one row (thread_idx % BlockM)
         ElementOut* O_base = params.ptr_O +
             batch_idx * params.stride_O_batch +
             head_idx * params.stride_O_head +
             global_row * params.stride_O_seq;
 
         CUTLASS_PRAGMA_UNROLL
-        for (int d = 0; d < kHeadDim; ++d) {
+        for (int d = 0; d < HeadDim; ++d) {
             O_base[d] = static_cast<ElementOut>(thread_output[d]);
         }
     }
