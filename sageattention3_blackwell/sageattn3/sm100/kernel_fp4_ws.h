@@ -29,8 +29,11 @@ using namespace cute;
 // SM100 FP4 Flash Attention Forward Kernel
 ///////////////////////////////////////////////////////////////////////////////
 
-template <typename Ktraits, bool Is_causal, typename TileScheduler>
+template <typename Ktraits_, bool Is_causal, typename TileScheduler>
 struct Sm100FlashFwdKernelFP4 {
+
+    // Expose Ktraits for external access
+    using Ktraits = Ktraits_;
 
     using ElementData = typename Ktraits::ElementData;
     using ElementSF = typename Ktraits::ElementSF;
@@ -49,6 +52,7 @@ struct Sm100FlashFwdKernelFP4 {
 
     ///////////////////////////////////////////////////////////////////////////
     // Arguments and Parameters
+    // Layout matches fmha_sm100.cu initialization order
     ///////////////////////////////////////////////////////////////////////////
 
     struct Arguments {
@@ -63,23 +67,27 @@ struct Sm100FlashFwdKernelFP4 {
         ElementSF const* ptr_SFQ;
         int64_t stride_Q_seq;
         int64_t stride_Q_head;
+        int64_t stride_Q_batch;
 
         // FP4 K tensor and scale factors
         ElementData const* ptr_K;
         ElementSF const* ptr_SFK;
         int64_t stride_K_seq;
         int64_t stride_K_head;
+        int64_t stride_K_batch;
 
         // FP4 V tensor and scale factors
         ElementData const* ptr_V;
         ElementSF const* ptr_SFV;
         int64_t stride_V_seq;
         int64_t stride_V_head;
+        int64_t stride_V_batch;
 
         // Output tensor (BF16)
         ElementOut* ptr_O;
         int64_t stride_O_seq;
         int64_t stride_O_head;
+        int64_t stride_O_batch;
 
         float scale_softmax;
     };
@@ -94,6 +102,7 @@ struct Sm100FlashFwdKernelFP4 {
         ElementOut* ptr_O;
         int64_t stride_O_seq;
         int64_t stride_O_head;
+        int64_t stride_O_batch;
     };
 
     static Params to_underlying_arguments(Arguments const& args, void* workspace) {
@@ -132,7 +141,8 @@ struct Sm100FlashFwdKernelFP4 {
             args.batch_size,
             args.ptr_O,
             args.stride_O_seq,
-            args.stride_O_head
+            args.stride_O_head,
+            args.stride_O_batch
         };
     }
 
