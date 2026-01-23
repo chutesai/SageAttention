@@ -17,13 +17,8 @@
 #include <cmath>
 
 #include "cute/tensor.hpp"
-#include "cute/arch/mma_sm100.hpp"
-#include "cute/arch/tmem.hpp"
-#include "cute/arch/copy_sm100_tma.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_conversion.h"
-#include "cutlass/arch/mma_sm100.hpp"
-#include "cutlass/gemm/collective/collective_builder.hpp"
 
 #include "kernel_traits_fp4.h"
 
