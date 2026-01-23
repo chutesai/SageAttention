@@ -112,21 +112,8 @@ struct Sm100FlashFwdKernelFP4 {
             make_tuple(args.num_heads, args.batch_size)
         );
 
-        typename CollectiveMainloop::Arguments mainloop_args{
-            args.ptr_Q, args.ptr_SFQ,
-            make_tuple(args.stride_Q_seq, _1{}, args.stride_Q_head),
-            typename Ktraits::LayoutSFA{},
-            args.ptr_K, args.ptr_SFK,
-            make_tuple(args.stride_K_seq, _1{}, args.stride_K_head),
-            typename Ktraits::LayoutSFB{},
-            args.ptr_V, args.ptr_SFV,
-            make_tuple(_1{}, args.stride_V_seq, args.stride_V_head),
-            typename Ktraits::LayoutSFB{},
-            args.scale_softmax
-        };
-
-        auto mainloop_params = CollectiveMainloop::to_underlying_arguments(
-            problem_shape, mainloop_args, workspace);
+        // Mainloop now directly uses kernel arguments
+        auto mainloop_params = CollectiveMainloop::to_underlying_arguments(args, workspace);
 
         typename TileScheduler::Arguments scheduler_args{};
         auto scheduler_params = TileScheduler::to_underlying_arguments(
