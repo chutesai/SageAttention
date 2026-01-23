@@ -89,11 +89,13 @@ using FmhaBF16Causal = FmhaKernelBF16<MaskCausal>;
 
 ///////////////////////////////////////////////////////////////////////////////
 // FP8 E4M3 FMHA Kernel Types - 2x tensor core throughput
+// NOTE: FP8 input, FP16 output (matches CUTLASS example 77)
 ///////////////////////////////////////////////////////////////////////////////
 
 using ElementFP8 = cutlass::float_e4m3_t;
-// FP8 uses 256x256 tile shape for optimal performance
-using TileShapeFP8 = Shape<_256, _256, _128>;
+using ElementFP8Out = cutlass::half_t;  // FP8 attention outputs FP16
+// FP8 uses same 256x128 tile shape as BF16 (from CUTLASS example 77)
+using TileShapeFP8 = Shape<_256, _128, _128>;
 
 template <typename ActiveMask>
 struct FmhaKernelFP8 {
@@ -105,8 +107,9 @@ struct FmhaKernelFP8 {
         ActiveMask
     >;
 
+    // FP8 FMHA outputs FP16, not FP8 (per CUTLASS example 77)
     using Epilogue = fmha_collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
-        ElementFP8, float,
+        ElementFP8Out, float,
         typename Mainloop::TileShapePV,
         StrideO, StrideLSE
     >;
