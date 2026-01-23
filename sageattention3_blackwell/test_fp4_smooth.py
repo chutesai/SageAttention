@@ -102,6 +102,8 @@ def preprocess_smooth(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_blo
         qm = q.mean(dim=-2, keepdim=True)
         q_smooth = q - qm
 
+    print(f"  qm shape: {qm.shape}, k_smooth shape: {k_smooth.shape}")
+
     # Compute correction term: qm @ k_smooth^T
     delta_s = compute_delta_s(qm, k_smooth)
 
