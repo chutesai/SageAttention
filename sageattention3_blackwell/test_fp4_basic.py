@@ -39,10 +39,15 @@ def test_identity_attention():
     print(f"  Ref max:   {ref.abs().max().item():.6f}")
     print(f"  Out max:   {out.abs().max().item():.6f}")
 
-    # Check correlation
-    ref_flat = ref.flatten()
-    out_flat = out.flatten()
-    corr = torch.corrcoef(torch.stack([ref_flat.float(), out_flat.float()]))[0, 1].item()
+    # Check correlation (on CPU to avoid CUBLAS issues)
+    ref_flat = ref.flatten().float().cpu()
+    out_flat = out.flatten().float().cpu()
+    # Manual correlation to avoid torch.corrcoef CUBLAS issues
+    ref_mean = ref_flat.mean()
+    out_mean = out_flat.mean()
+    ref_centered = ref_flat - ref_mean
+    out_centered = out_flat - out_mean
+    corr = (ref_centered * out_centered).sum() / (ref_centered.norm() * out_centered.norm() + 1e-8)
     print(f"  Correlation: {corr:.4f}")
 
 
