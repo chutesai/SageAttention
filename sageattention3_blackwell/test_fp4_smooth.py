@@ -74,7 +74,10 @@ def compute_delta_s(qm: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     Returns:
         delta_s: [batch, heads, num_q_groups, seqlen_k] correction tensor
     """
-    return torch.einsum('bhmd,bhnd->bhmn', qm.float(), k.float())
+    # qm: [B, H, M, D] where M = num_q_groups
+    # k:  [B, H, N, D] where N = seqlen_k
+    # output: [B, H, M, N]
+    return torch.matmul(qm.float(), k.float().transpose(-2, -1))
 
 
 def preprocess_smooth(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, per_block_mean: bool = True):
