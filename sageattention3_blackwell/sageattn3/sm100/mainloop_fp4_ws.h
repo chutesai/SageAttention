@@ -19,6 +19,7 @@
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_conversion.h"
+#include "cutlass/float_subbyte.h"
 
 #include "kernel_traits_fp4.h"
 
@@ -114,20 +115,13 @@ struct CollectiveMainloopFwdSm100FP4 {
     // direct GMEM approach initially to get functional correctness
     ///////////////////////////////////////////////////////////////////////////
 
-    // Helper to decode FP4 E2M1 nibble to float
+    // Helper to decode FP4 E2M1 nibble to float using CUTLASS's type
     // E2M1 format: 1 sign bit, 2 exponent bits, 1 mantissa bit
     // Values: 0, 0.5, 1, 1.5, 2, 3, 4, 6 (and negatives)
-    // Nibble layout: S EE M where S=sign, EE=exponent, M=mantissa
     CUTLASS_DEVICE static float decode_fp4_e2m1(uint8_t nibble) {
-        // E2M1 lookup table for positive values (nibbles 0-7)
-        // 0b000 = 0, 0b001 = 0.5, 0b010 = 1, 0b011 = 1.5
-        // 0b100 = 2, 0b101 = 3,   0b110 = 4, 0b111 = 6
-        constexpr float e2m1_lut[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-
-        bool sign = (nibble >> 3) & 1;
-        uint8_t magnitude = nibble & 0x7;
-        float value = e2m1_lut[magnitude];
-        return sign ? -value : value;
+        // Use CUTLASS's float_e2m1_t which has proper conversion to float
+        cutlass::float_e2m1_t fp4_val = cutlass::float_e2m1_t::bitcast(nibble);
+        return static_cast<float>(fp4_val);
     }
 
     struct Params {
