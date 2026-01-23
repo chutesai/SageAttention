@@ -114,23 +114,32 @@ struct CollectiveMainloopFwdSm100FP4 {
     // direct GMEM approach initially to get functional correctness
     ///////////////////////////////////////////////////////////////////////////
 
+    // Helper to decode linear 4-bit value to float
+    // Input: 4-bit value (0-15), mapped from [-6, +6] via (x/6 * 7.5 + 7.5)
+    // Output: float in roughly [-1, +1] range (before scale factor)
+    CUTLASS_DEVICE static float decode_fp4_linear(uint8_t nibble) {
+        // Reverse the encoding: (nibble - 7.5) / 7.5 * 6.0
+        // Simplified: (nibble - 7.5) * 0.8
+        return (static_cast<float>(nibble) - 7.5f) * 0.8f;
+    }
+
     struct Params {
-        // Q data and scale factors
-        ElementData const* ptr_Q;
+        // Q data (packed uint8, 2 FP4 values per byte) and scale factors
+        uint8_t const* ptr_Q;
         ElementSF const* ptr_SFQ;
-        int64_t stride_Q_seq;
+        int64_t stride_Q_seq;  // In packed bytes (HeadDim/2)
         int64_t stride_Q_head;
         int64_t stride_Q_batch;
 
         // K data and scale factors
-        ElementData const* ptr_K;
+        uint8_t const* ptr_K;
         ElementSF const* ptr_SFK;
         int64_t stride_K_seq;
         int64_t stride_K_head;
         int64_t stride_K_batch;
 
         // V data and scale factors
-        ElementData const* ptr_V;
+        uint8_t const* ptr_V;
         ElementSF const* ptr_SFV;
         int64_t stride_V_seq;
         int64_t stride_V_head;
@@ -155,19 +164,19 @@ struct CollectiveMainloopFwdSm100FP4 {
         float log2_e = static_cast<float>(M_LOG2E);
 
         return Params{
-            args.ptr_Q,
+            reinterpret_cast<uint8_t const*>(args.ptr_Q),
             args.ptr_SFQ,
             args.stride_Q_seq,
             args.stride_Q_head,
             args.stride_Q_batch,
 
-            args.ptr_K,
+            reinterpret_cast<uint8_t const*>(args.ptr_K),
             args.ptr_SFK,
             args.stride_K_seq,
             args.stride_K_head,
             args.stride_K_batch,
 
-            args.ptr_V,
+            reinterpret_cast<uint8_t const*>(args.ptr_V),
             args.ptr_SFV,
             args.stride_V_seq,
             args.stride_V_head,
@@ -260,11 +269,14 @@ struct CollectiveMainloopFwdSm100FP4 {
         }
 
         // Compute base pointers for this batch/head
-        ElementData const* Q_base = params.ptr_Q +
+        // Data is packed as uint8 (2 FP4 values per byte), strides are in packed bytes
+        uint8_t const* Q_base = params.ptr_Q +
             batch_idx * params.stride_Q_batch +
             head_idx * params.stride_Q_head +
             global_row * params.stride_Q_seq;
 
+        // Scale factor strides need adjustment - they're per-block not per-element
+        // SF layout: [batch, heads, seqlen, num_blocks] where num_blocks = HeadDim/16
         ElementSF const* SFQ_base = params.ptr_SFQ +
             batch_idx * params.stride_Q_batch / SFVecSize +
             head_idx * params.stride_Q_head / SFVecSize +
@@ -295,7 +307,7 @@ struct CollectiveMainloopFwdSm100FP4 {
                 }
 
                 // Compute dot product Q[my_row] @ K[k_col]
-                ElementData const* K_base = params.ptr_K +
+                uint8_t const* K_base = params.ptr_K +
                     batch_idx * params.stride_K_batch +
                     head_idx * params.stride_K_head +
                     global_k * params.stride_K_seq;
@@ -306,6 +318,7 @@ struct CollectiveMainloopFwdSm100FP4 {
                     global_k * params.stride_K_seq / SFVecSize;
 
                 // Block-scaled dot product: sum over blocks
+                // Data is packed: 2 FP4 values per byte, HeadDim/2 bytes per row
                 float dot = 0.0f;
                 for (int blk = 0; blk < HeadDim / SFVecSize; ++blk) {
                     // Get scale factors for this block
@@ -313,12 +326,21 @@ struct CollectiveMainloopFwdSm100FP4 {
                     float sf_k = static_cast<float>(SFK_base[blk]);
                     float scale = sf_q * sf_k;
 
-                    // Dot product within block (FP4 values)
-                    for (int i = 0; i < SFVecSize; ++i) {
-                        int idx = blk * SFVecSize + i;
-                        float q_val = static_cast<float>(Q_base[idx]);
-                        float k_val = static_cast<float>(K_base[idx]);
-                        dot += q_val * k_val * scale;
+                    // Dot product within block (16 FP4 values = 8 packed bytes)
+                    for (int i = 0; i < SFVecSize; i += 2) {
+                        int byte_idx = (blk * SFVecSize + i) / 2;
+                        uint8_t q_packed = Q_base[byte_idx];
+                        uint8_t k_packed = K_base[byte_idx];
+
+                        // Unpack low nibble (even index)
+                        float q_lo = decode_fp4_linear(q_packed & 0x0F);
+                        float k_lo = decode_fp4_linear(k_packed & 0x0F);
+                        dot += q_lo * k_lo * scale;
+
+                        // Unpack high nibble (odd index)
+                        float q_hi = decode_fp4_linear((q_packed >> 4) & 0x0F);
+                        float k_hi = decode_fp4_linear((k_packed >> 4) & 0x0F);
+                        dot += q_hi * k_hi * scale;
                     }
                 }
 
@@ -342,7 +364,7 @@ struct CollectiveMainloopFwdSm100FP4 {
                 float p = expf(s - row_max);
 
                 // V contribution: O += P * V
-                ElementData const* V_base = params.ptr_V +
+                uint8_t const* V_base = params.ptr_V +
                     batch_idx * params.stride_V_batch +
                     head_idx * params.stride_V_head +
                     global_k * params.stride_V_seq;
@@ -354,10 +376,17 @@ struct CollectiveMainloopFwdSm100FP4 {
 
                 for (int blk = 0; blk < HeadDim / SFVecSize; ++blk) {
                     float sf_v = static_cast<float>(SFV_base[blk]);
-                    for (int i = 0; i < SFVecSize; ++i) {
-                        int d = blk * SFVecSize + i;
-                        float v_val = static_cast<float>(V_base[d]) * sf_v;
-                        thread_output[d] += p * v_val;
+                    for (int i = 0; i < SFVecSize; i += 2) {
+                        int byte_idx = (blk * SFVecSize + i) / 2;
+                        uint8_t v_packed = V_base[byte_idx];
+
+                        // Unpack and accumulate
+                        int d_lo = blk * SFVecSize + i;
+                        int d_hi = d_lo + 1;
+                        float v_lo = decode_fp4_linear(v_packed & 0x0F) * sf_v;
+                        float v_hi = decode_fp4_linear((v_packed >> 4) & 0x0F) * sf_v;
+                        thread_output[d_lo] += p * v_lo;
+                        thread_output[d_hi] += p * v_hi;
                     }
                 }
             }
