@@ -754,17 +754,18 @@ torch::Tensor fmha_fwd_fp4_from_bf16(
     auto v_int = ((v_scaled / fp4_max * 7.5f + 7.5f).to(torch::kInt8)).view({batch, heads, seqlen_k, 256});
 
     // Pack pairs of 4-bit values into uint8
+    // Use multiplication by 16 instead of << 4 to avoid CUTE namespace conflict
     auto q_even = q_int.index({"...", torch::indexing::Slice(0, torch::indexing::None, 2)});
     auto q_odd = q_int.index({"...", torch::indexing::Slice(1, torch::indexing::None, 2)});
-    auto q_data = ((q_even & 0x0F) | ((q_odd & 0x0F) << 4)).to(torch::kUInt8);
+    auto q_data = ((q_even & 0x0F) | ((q_odd & 0x0F) * 16)).to(torch::kUInt8);
 
     auto k_even = k_int.index({"...", torch::indexing::Slice(0, torch::indexing::None, 2)});
     auto k_odd = k_int.index({"...", torch::indexing::Slice(1, torch::indexing::None, 2)});
-    auto k_data = ((k_even & 0x0F) | ((k_odd & 0x0F) << 4)).to(torch::kUInt8);
+    auto k_data = ((k_even & 0x0F) | ((k_odd & 0x0F) * 16)).to(torch::kUInt8);
 
     auto v_even = v_int.index({"...", torch::indexing::Slice(0, torch::indexing::None, 2)});
     auto v_odd = v_int.index({"...", torch::indexing::Slice(1, torch::indexing::None, 2)});
-    auto v_data = ((v_even & 0x0F) | ((v_odd & 0x0F) << 4)).to(torch::kUInt8);
+    auto v_data = ((v_even & 0x0F) | ((v_odd & 0x0F) * 16)).to(torch::kUInt8);
 
     // Run FP4 attention
     auto out_padded = fmha_fwd_fp4(q_data, q_sf, k_data, k_sf, v_data, v_sf, is_causal, scale);

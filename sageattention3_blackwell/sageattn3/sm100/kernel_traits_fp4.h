@@ -214,7 +214,7 @@ struct Flash_fwd_kernel_traits_sm100_fp4 {
         ElementAccum,
         TileShapeQK, ClusterShape_MNK,
         cutlass::gemm::collective::StageCountAuto,
-        cutlass::gemm::KernelScheduleAuto  // Auto-select best SM100 blockscaled schedule
+        cutlass::gemm::collective::KernelScheduleAuto  // Auto-select best SM100 blockscaled schedule
     >::CollectiveOp;
 
     // For PV matmul: P (M x N) @ V (N x D) -> O (M x D)
@@ -227,7 +227,7 @@ struct Flash_fwd_kernel_traits_sm100_fp4 {
         ElementAccum,
         TileShapePV, ClusterShape_MNK,
         cutlass::gemm::collective::StageCountAuto,
-        cutlass::gemm::KernelScheduleAuto
+        cutlass::gemm::collective::KernelScheduleAuto
     >::CollectiveOp;
 
     // Extract MMA types from CollectiveBuilder

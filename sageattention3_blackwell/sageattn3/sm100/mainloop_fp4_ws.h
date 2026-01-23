@@ -881,7 +881,7 @@ struct CollectiveMainloopFwdSm100FP4 {
         // For FP4 output P, we need to quantize after softmax
         auto tilePlikeFP4 = get<1>(TileShapeQK{}) / Int<sizeof(float)>{} * Int<sizeof(ElementData)>{};
         Tensor tStS_P = tStS.compose(make_layout(make_shape(_128{}, tilePlikeFP4)));
-        tStS_P.data() = warp_uniform(uint32_t(stage == 0 ? TmemAlloc::P0 : TmemAlloc::P1));
+        tStS_P.data() = uint32_t(stage == 0 ? TmemAlloc::P0 : TmemAlloc::P1);
         Tensor tScS_P = tScS.compose(make_layout(make_shape(_128{}, tilePlikeFP4)));
 
         using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b32x;
@@ -906,7 +906,7 @@ struct CollectiveMainloopFwdSm100FP4 {
         auto thr_tmem_store = tiled_tmem_store.get_slice(thread_idx);
 
         Tensor tTMEM_STOREtS_x4 = thr_tmem_store.partition_D(tStS_P);
-        tTMEM_STOREtS_x4.data() = warp_uniform(tTMEM_STOREtS_x4.data().get());
+        // Note: removed warp_uniform wrapper - compiler should still optimize correctly
         Tensor tTMEM_STOREcS = thr_tmem_store.partition_S(tScS_P);
 
         // Wait on tensor core pipe

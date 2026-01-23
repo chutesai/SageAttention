@@ -214,7 +214,7 @@ struct Sm100FlashFwdKernelFP4 {
         TmemAllocator tmem_allocator;
         if (role == WarpRole::MMA && lane_predicate) {
             shared_storage.tmem_base_ptr = tmem_allocator.allocate(
-                uint32_t(typename Ktraits::TmemAlloc::kEnd));
+                static_cast<uint32_t>(Ktraits::TmemAlloc::kEnd));
         }
         __syncthreads();
 
