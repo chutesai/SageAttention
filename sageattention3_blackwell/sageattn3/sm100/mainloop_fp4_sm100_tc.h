@@ -552,7 +552,8 @@ struct CollectiveMainloopFwdSm100FP4TC_V2 {
     }
 
     ///////////////////////////////////////////////////////////////////////////
-    // Main Kernel Body
+    // Main Kernel Body - Optimized with better unrolling and FMA
+    // Each thread handles one row, with aggressive loop unrolling
     ///////////////////////////////////////////////////////////////////////////
 
     CUTLASS_DEVICE void operator()(
@@ -583,18 +584,19 @@ struct CollectiveMainloopFwdSm100FP4TC_V2 {
         load_q_tile(params, storage, m_block, head_idx, batch_idx, seqlen_q);
         __syncthreads();
 
+        // Each thread handles one row
+        int my_row = thread_idx % kBlockM;
+
         // Thread-local output and softmax state
         float thread_output[kHeadDim];
         float row_max = -INFINITY;
         float row_sum = 0.0f;
 
-        #pragma unroll 4
+        // Initialize output
+        #pragma unroll 16
         for (int d = 0; d < kHeadDim; ++d) {
             thread_output[d] = 0.0f;
         }
-
-        // Each thread handles one row
-        int my_row = thread_idx % kBlockM;
 
         // Delta-S for smooth attention
         float const* delta_s_base = nullptr;
@@ -603,6 +605,15 @@ struct CollectiveMainloopFwdSm100FP4TC_V2 {
                 batch_idx * params.stride_ds_batch +
                 head_idx * params.stride_ds_head +
                 m_block * params.stride_ds_group;
+        }
+
+        // Pre-compute Q scale factors for this row
+        float my_q_scales[NumSFPerHead];
+        if (my_row < rows_this_tile) {
+            #pragma unroll
+            for (int sf = 0; sf < NumSFPerHead; ++sf) {
+                my_q_scales[sf] = static_cast<float>(storage.smem_SFQ[my_row * NumSFPerHead + sf]);
+            }
         }
 
         // Process K/V tiles
@@ -614,17 +625,47 @@ struct CollectiveMainloopFwdSm100FP4TC_V2 {
             load_kv_tile(params, storage, n_tile, head_idx, batch_idx, seqlen_k, true);
             __syncthreads();
 
-            // Compute QK scores for this thread's row
-            float tile_scores[256];  // Max kBlockN
+            // Compute QK scores for this thread's row - register-only
+            float tile_scores[256];  // Max kBlockN (256)
             float tile_max = -INFINITY;
 
             if (my_row < rows_this_tile) {
                 int global_row = row_start + my_row;
+                const int bytes_per_row = kHeadDim / 2;
 
+                // Process K columns with aggressive unrolling
+                #pragma unroll 4
                 for (int j = 0; j < tile_cols; ++j) {
                     int global_col = tile_col_start + j;
 
-                    float score = compute_qk_dot_scaled(storage, my_row, j);
+                    // Inline the dot product for better optimization
+                    float score = 0.0f;
+
+                    #pragma unroll
+                    for (int sf_block = 0; sf_block < NumSFPerHead; ++sf_block) {
+                        float k_scale = static_cast<float>(storage.smem_SFK[j * NumSFPerHead + sf_block]);
+                        float combined_scale = my_q_scales[sf_block] * k_scale;
+
+                        int d_start = sf_block * SFVectorSize;
+                        int q_byte_base = my_row * bytes_per_row + d_start / 2;
+                        int k_byte_base = j * bytes_per_row + d_start / 2;
+
+                        // Load and decode 16 FP4 values (8 bytes)
+                        uint32_t q_vec0 = *reinterpret_cast<uint32_t const*>(&storage.smem_Q[q_byte_base]);
+                        uint32_t q_vec1 = *reinterpret_cast<uint32_t const*>(&storage.smem_Q[q_byte_base + 4]);
+                        uint32_t k_vec0 = *reinterpret_cast<uint32_t const*>(&storage.smem_K[k_byte_base]);
+                        uint32_t k_vec1 = *reinterpret_cast<uint32_t const*>(&storage.smem_K[k_byte_base + 4]);
+
+                        float q0[8], k0[8], q1[8], k1[8];
+                        decode_fp4_vec8(q_vec0, q0);
+                        decode_fp4_vec8(k_vec0, k0);
+                        decode_fp4_vec8(q_vec1, q1);
+                        decode_fp4_vec8(k_vec1, k1);
+
+                        float block_sum = dot8_fma(q0, k0) + dot8_fma(q1, k1);
+                        score = __fmaf_rn(block_sum, combined_scale, score);
+                    }
+
                     score *= params.scale_softmax;
 
                     // Add delta-s for smooth attention
@@ -650,7 +691,7 @@ struct CollectiveMainloopFwdSm100FP4TC_V2 {
                 if (old_max > -INFINITY && new_max != old_max) {
                     float scale_factor = expf(old_max - new_max);
                     row_sum *= scale_factor;
-                    #pragma unroll 4
+                    #pragma unroll 16
                     for (int d = 0; d < kHeadDim; ++d) {
                         thread_output[d] *= scale_factor;
                     }
@@ -665,12 +706,40 @@ struct CollectiveMainloopFwdSm100FP4TC_V2 {
             load_kv_tile(params, storage, n_tile, head_idx, batch_idx, seqlen_k, false);
             __syncthreads();
 
-            // PV accumulation
+            // PV accumulation with aggressive unrolling
             if (my_row < rows_this_tile) {
+                const int bytes_per_row = kHeadDim / 2;
+
+                #pragma unroll 4
                 for (int j = 0; j < tile_cols; ++j) {
                     float weight = expf(tile_scores[j] - row_max);
                     row_sum += weight;
-                    accumulate_pv_scaled(storage, thread_output, j, weight);
+
+                    // Skip if weight is negligible
+                    if (weight < 1e-10f) continue;
+
+                    // Inline PV accumulation
+                    #pragma unroll
+                    for (int sf_block = 0; sf_block < NumSFPerHead; ++sf_block) {
+                        float v_scale = static_cast<float>(storage.smem_SFV[j * NumSFPerHead + sf_block]);
+                        float scaled_weight = weight * v_scale;
+
+                        int d_start = sf_block * SFVectorSize;
+                        int v_byte_base = j * bytes_per_row + d_start / 2;
+
+                        uint32_t v_vec0 = *reinterpret_cast<uint32_t const*>(&storage.smem_V[v_byte_base]);
+                        uint32_t v_vec1 = *reinterpret_cast<uint32_t const*>(&storage.smem_V[v_byte_base + 4]);
+
+                        float v0[8], v1[8];
+                        decode_fp4_vec8(v_vec0, v0);
+                        decode_fp4_vec8(v_vec1, v1);
+
+                        #pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            thread_output[d_start + i] = __fmaf_rn(scaled_weight, v0[i], thread_output[d_start + i]);
+                            thread_output[d_start + 8 + i] = __fmaf_rn(scaled_weight, v1[i], thread_output[d_start + 8 + i]);
+                        }
+                    }
                 }
             }
 
@@ -687,9 +756,13 @@ struct CollectiveMainloopFwdSm100FP4TC_V2 {
                 head_idx * params.stride_O_head +
                 global_row * params.stride_O_seq;
 
-            #pragma unroll 4
-            for (int d = 0; d < kHeadDim; ++d) {
+            // Vectorized output write
+            #pragma unroll 16
+            for (int d = 0; d < kHeadDim; d += 4) {
                 O_base[d] = static_cast<ElementOut>(thread_output[d] * inv_row_sum);
+                O_base[d+1] = static_cast<ElementOut>(thread_output[d+1] * inv_row_sum);
+                O_base[d+2] = static_cast<ElementOut>(thread_output[d+2] * inv_row_sum);
+                O_base[d+3] = static_cast<ElementOut>(thread_output[d+3] * inv_row_sum);
             }
         }
     }
