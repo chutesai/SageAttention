@@ -135,6 +135,7 @@ using FmhaFP8Causal = FmhaKernelFP8<MaskCausal>;
 #include "kernel_fp4_ws.h"
 #include "mainloop_fp4_mma.h"  // CuTe TiledMMA interface for tensor cores
 #include "mainloop_fp4_tc_sm100.h"  // High-performance tensor core implementation
+#include "mainloop_fp4_cute_mma.h"  // CuTe-based MMA implementation
 
 using ElementFP4 = cutlass::float_e2m1_t;
 using ElementFP4SF = cutlass::float_e4m3_t;  // Signed E4M3 to match PyTorch float8_e4m3fn
@@ -220,8 +221,24 @@ struct FmhaKernelFP4Tcgen05 {
     using Kernel = flash::Sm100FlashFwdKernelFP4TensorCore<Ktraits, Is_causal, TileScheduler>;
 };
 
+// FP4 CuTe MMA variant - CuTe-based implementation for future tensor core MMA integration
+template <bool Is_causal>
+struct FmhaKernelFP4CuteMma {
+    using Ktraits = flash::Flash_fwd_kernel_traits_sm100_fp4_cute_mma<
+        256,   // kHeadDim (must be 256 for FP4)
+        128,   // kBlockM (matches MMA M size)
+        256,   // kBlockN (must be 256 for FP4 PV matmul)
+        ElementFP4Out
+    >;
+
+    using TileScheduler = flash::SimpleTileSchedulerFP4;
+    using Kernel = flash::Sm100FlashFwdKernelFP4CuteMma<Ktraits, Is_causal, TileScheduler>;
+};
+
 using FmhaFP4NoMask = FmhaKernelFP4<false>;
 using FmhaFP4Causal = FmhaKernelFP4<true>;
+using FmhaFP4CuteMmaNoMask = FmhaKernelFP4CuteMma<false>;
+using FmhaFP4CuteMmaCausal = FmhaKernelFP4CuteMma<true>;
 using FmhaFP4TCNoMask = FmhaKernelFP4TC<false>;
 using FmhaFP4TCCausal = FmhaKernelFP4TC<true>;
 using FmhaFP4TensorNoMask = FmhaKernelFP4TensorOpt<false>;
