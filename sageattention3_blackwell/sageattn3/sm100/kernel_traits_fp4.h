@@ -191,4 +191,135 @@ struct Flash_fwd_kernel_traits_sm100_fp4 {
     using StrideO = Stride<int64_t, _1, int64_t>;
 };
 
+///////////////////////////////////////////////////////////////////////////////
+// SM100 FP4 Block-Scaled Flash Forward Kernel Traits - Tensor Core Variant
+//
+// This version has proper SMEM sizing for cooperative data loading
+// and tensor core execution (hybrid implementation).
+///////////////////////////////////////////////////////////////////////////////
+
+template <
+    int kHeadDim_,    // Head dimension (128 or 256)
+    int kBlockM_,     // Block size for Q rows (128 or 256)
+    int kBlockN_,     // Block size for K/V sequence (128 or 256)
+    int kStages_,     // Pipeline stages (2-4)
+    int kClusterM_,   // Cluster shape in M (1)
+    bool BlockMean_,  // Whether to use block mean subtraction
+    typename ElementOut_ = cutlass::bfloat16_t
+>
+struct Flash_fwd_kernel_traits_sm100_fp4_tc {
+
+    // Basic configuration
+    static constexpr int kBlockM = kBlockM_;
+    static constexpr int kBlockN = kBlockN_;
+    static constexpr int kHeadDim = kHeadDim_;
+    static constexpr bool BlockMean = BlockMean_;
+    static constexpr int kClusterM = kClusterM_;
+    static constexpr int kStages = kStages_;
+    static constexpr int EpiStages = 2;
+
+    // For tensor core implementation with SMEM staging
+    // Use 4 warps (128 threads) for better occupancy
+    static constexpr int kNWarps = 4;
+    static constexpr int kNThreads = kNWarps * 32;  // 128 threads
+
+    //=========================================================================
+    // Element Types for FP4 Block-Scaled Attention
+    //=========================================================================
+
+    using Element = cutlass::float_e2m1_t;           // FP4 data (E2M1)
+    using ElementSF = cutlass::float_e4m3_t;         // Scale factor (E4M3)
+    using ElementAccum = float;                       // FP32 accumulator
+    using ElementOut = ElementOut_;                   // Output type (BF16)
+    using index_t = int64_t;
+
+    // Scale factor configuration - 16 elements per scale factor block
+    static constexpr int SFVectorSize = 16;
+    static constexpr int NumSFPerHeadDim = kHeadDim / SFVectorSize;
+    static constexpr int NumSFPerBlockN = kBlockN / SFVectorSize;
+
+    //=========================================================================
+    // Tile Shapes
+    //=========================================================================
+
+    using TileShape_MNK = Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
+    using ClusterShape_MNK = Shape<Int<kClusterM>, _1, _1>;
+
+    //=========================================================================
+    // MMA Configuration
+    //=========================================================================
+
+    // SM100_MMA_MXF4_SS: M=128, N=8-256, K=64
+    static constexpr int kMmaM = 128;
+    static constexpr int kMmaN = 128;
+    static constexpr int kMmaK = 64;
+
+    static constexpr int NumMmaAtomsM = kBlockM / kMmaM;
+    static constexpr int NumMmaAtomsN = kBlockN / kMmaN;
+
+    //=========================================================================
+    // Scale Factor Configuration
+    //=========================================================================
+
+    using BlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<SFVectorSize>;
+    using LayoutSF = decltype(BlkScaledConfig::deduce_layoutSFA());
+
+    static constexpr int MMA_NSF = kMmaK / SFVectorSize;
+
+    //=========================================================================
+    // SMEM Sizes (in bytes)
+    //=========================================================================
+
+    // FP4 data is packed (2 values per byte)
+    static constexpr int SmemSizeQ = kBlockM * kHeadDim / 2;
+    static constexpr int SmemSizeK = kBlockN * kHeadDim / 2;
+    static constexpr int SmemSizeV = kBlockN * kHeadDim / 2;
+
+    // Scale factors (1 byte per FP8 E4M3)
+    static constexpr int SmemSizeSFQ = kBlockM * NumSFPerHeadDim;
+    static constexpr int SmemSizeSFK = kBlockN * NumSFPerHeadDim;
+    static constexpr int SmemSizeSFV = kBlockN * NumSFPerHeadDim;
+
+    // Scratch space for softmax statistics
+    static constexpr int SmemSizeScratch = kBlockM * 4 * sizeof(float);
+
+    // Total SMEM (with 128-byte alignment)
+    static constexpr int SmemSizeTotal =
+        ((SmemSizeQ + 127) / 128 * 128) +
+        ((SmemSizeK + 127) / 128 * 128) +
+        ((SmemSizeV + 127) / 128 * 128) +
+        ((SmemSizeSFQ + 127) / 128 * 128) +
+        ((SmemSizeSFK + 127) / 128 * 128) +
+        ((SmemSizeSFV + 127) / 128 * 128) +
+        ((SmemSizeScratch + 127) / 128 * 128);
+
+    //=========================================================================
+    // Shared Storage for Tensor Core Implementation
+    //=========================================================================
+
+    struct SharedStorage {
+        // FP4 data tiles (packed, 2 values per byte)
+        alignas(128) uint8_t smem_Q[SmemSizeQ];
+        alignas(128) uint8_t smem_K[SmemSizeK];
+        alignas(128) uint8_t smem_V[SmemSizeV];
+
+        // Scale factor tiles
+        alignas(128) ElementSF smem_SFQ[kBlockM * NumSFPerHeadDim];
+        alignas(128) ElementSF smem_SFK[kBlockN * NumSFPerHeadDim];
+        alignas(128) ElementSF smem_SFV[kBlockN * NumSFPerHeadDim];
+
+        // Scratch for softmax stats
+        alignas(128) float smem_scratch[kBlockM * 4];
+    };
+
+    //=========================================================================
+    // Strides
+    //=========================================================================
+
+    using StrideQ = Stride<int64_t, _1, int64_t>;
+    using StrideK = Stride<int64_t, _1, int64_t>;
+    using StrideV = Stride<_1, int64_t, int64_t>;
+    using StrideO = Stride<int64_t, _1, int64_t>;
+};
+
 } // namespace flash

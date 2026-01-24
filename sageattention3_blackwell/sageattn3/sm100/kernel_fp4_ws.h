@@ -20,6 +20,7 @@
 
 #include "kernel_traits_fp4.h"
 #include "mainloop_fp4_ws.h"
+#include "mainloop_fp4_tc.h"  // Tensor core variant
 
 namespace flash {
 
@@ -234,6 +235,109 @@ struct SimpleTileSchedulerFP4 {
         int batch_idx = remainder / params.num_heads;
 
         return WorkTileInfo{m_block, head_idx, batch_idx, true};
+    }
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// SM100 FP4 Flash Attention Forward Kernel - Tensor Core Variant
+//
+// Uses SMEM staging for cooperative data loading and higher occupancy.
+// This is a hybrid approach that loads data cooperatively to SMEM but
+// still uses scalar FP4 decoding for the compute (until full tcgen05.mma
+// integration is complete).
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename Ktraits_, bool Is_causal, typename TileScheduler>
+struct Sm100FlashFwdKernelFP4TC {
+
+    using Ktraits = Ktraits_;
+
+    using Element = typename Ktraits::Element;
+    using ElementSF = typename Ktraits::ElementSF;
+    using ElementOut = typename Ktraits::ElementOut;
+    using ElementAccum = typename Ktraits::ElementAccum;
+
+    using TileShape_MNK = typename Ktraits::TileShape_MNK;
+    using SharedStorage = typename Ktraits::SharedStorage;
+
+    // Use tensor core mainloop
+    using CollectiveMainloop = CollectiveMainloopFwdSm100FP4TC<Ktraits, Is_causal>;
+
+    static constexpr int kBlockM = Ktraits::kBlockM;
+    static constexpr int kBlockN = Ktraits::kBlockN;
+    static constexpr int kHeadDim = Ktraits::kHeadDim;
+    static constexpr int kNThreads = Ktraits::kNThreads;
+
+    // Reuse Arguments from base kernel
+    using Arguments = typename Sm100FlashFwdKernelFP4<Ktraits, Is_causal, TileScheduler>::Arguments;
+
+    struct Params {
+        typename CollectiveMainloop::Params mainloop;
+        typename TileScheduler::Params scheduler;
+        int seqlen_q;
+        int seqlen_k;
+        int num_heads;
+        int batch_size;
+    };
+
+    static Params to_underlying_arguments(Arguments const& args, void* workspace) {
+        auto problem_shape = make_tuple(
+            args.seqlen_q, args.seqlen_k, args.head_dim,
+            make_tuple(args.num_heads, args.batch_size)
+        );
+
+        auto mainloop_params = CollectiveMainloop::to_underlying_arguments(args, workspace);
+
+        typename TileScheduler::Arguments scheduler_args{};
+        auto scheduler_params = TileScheduler::to_underlying_arguments(
+            problem_shape, TileShape_MNK{}, scheduler_args, workspace);
+
+        return Params{
+            mainloop_params,
+            scheduler_params,
+            args.seqlen_q,
+            args.seqlen_k,
+            args.num_heads,
+            args.batch_size
+        };
+    }
+
+    static dim3 get_grid_dim(Arguments const& args, int sm_count) {
+        int num_m_blocks = (args.seqlen_q + kBlockM - 1) / kBlockM;
+        int num_tiles = num_m_blocks * args.num_heads * args.batch_size;
+        return dim3(min(num_tiles, sm_count), 1, 1);
+    }
+
+    static dim3 get_block_dim() {
+        return dim3(kNThreads, 1, 1);
+    }
+
+    static size_t get_smem_size() {
+        return sizeof(SharedStorage);
+    }
+
+    CUTLASS_DEVICE void operator()(Params const& params, char* smem) {
+        SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem);
+
+        TileScheduler scheduler;
+        auto work_tile = scheduler.get_initial_work(params.scheduler);
+
+        if (!work_tile.is_valid()) {
+            return;
+        }
+
+        auto [m_block, head_idx, batch_idx] = work_tile.get_block_coord();
+
+        CollectiveMainloop mainloop;
+        mainloop(
+            params.mainloop,
+            shared_storage,
+            m_block,
+            head_idx,
+            batch_idx,
+            params.seqlen_q,
+            params.seqlen_k
+        );
     }
 };
 

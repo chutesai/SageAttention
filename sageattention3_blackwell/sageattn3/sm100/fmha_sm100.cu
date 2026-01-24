@@ -156,8 +156,27 @@ struct FmhaKernelFP4 {
     using Kernel = flash::Sm100FlashFwdKernelFP4<Ktraits, Is_causal, TileScheduler>;
 };
 
+// FP4 Tensor Core variant with SMEM staging (higher occupancy)
+template <bool Is_causal>
+struct FmhaKernelFP4TC {
+    using Ktraits = flash::Flash_fwd_kernel_traits_sm100_fp4_tc<
+        256,   // kHeadDim (must be 256 for FP4)
+        128,   // kBlockM
+        256,   // kBlockN
+        2,     // kStages
+        1,     // kClusterM
+        false, // BlockMean
+        ElementFP4Out
+    >;
+
+    using TileScheduler = flash::SimpleTileSchedulerFP4;
+    using Kernel = flash::Sm100FlashFwdKernelFP4TC<Ktraits, Is_causal, TileScheduler>;
+};
+
 using FmhaFP4NoMask = FmhaKernelFP4<false>;
 using FmhaFP4Causal = FmhaKernelFP4<true>;
+using FmhaFP4TCNoMask = FmhaKernelFP4TC<false>;
+using FmhaFP4TCCausal = FmhaKernelFP4TC<true>;
 
 // Forward declaration of FP4 kernel wrapper
 template <typename Kernel>
