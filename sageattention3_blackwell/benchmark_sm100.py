@@ -65,7 +65,6 @@ def main():
         (1, 32, 4096, 128),
         (1, 16, 1024, 256),   # HeadDim=256 for FP4
         (1, 16, 2048, 256),
-        (1, 16, 4096, 256),
     ]
 
     for batch, heads, seqlen, head_dim in configs:
@@ -81,17 +80,33 @@ def main():
         # Compute TFLOPS (2 * batch * heads * seqlen^2 * head_dim for QK, same for PV)
         flops = 4 * batch * heads * seqlen * seqlen * head_dim
 
-        # BF16 benchmark
+        # BF16 benchmark (SM100 kernel only supports head_dim=128)
         time_bf16 = None
-        try:
-            def run_bf16():
-                return fmha_sm100.fwd_bf16(q_bf16, k_bf16, v_bf16, False, scale)
+        if head_dim == 128:
+            try:
+                def run_bf16():
+                    return fmha_sm100.fwd_bf16(q_bf16, k_bf16, v_bf16, False, scale)
 
-            time_bf16 = benchmark_kernel(run_bf16)
-            tflops_bf16 = flops / (time_bf16 / 1000) / 1e12
-            print(f"  BF16:  {time_bf16:8.3f} ms  ({tflops_bf16:7.1f} TFLOPS)")
+                time_bf16 = benchmark_kernel(run_bf16)
+                tflops_bf16 = flops / (time_bf16 / 1000) / 1e12
+                print(f"  BF16:  {time_bf16:8.3f} ms  ({tflops_bf16:7.1f} TFLOPS)")
+            except Exception as e:
+                print(f"  BF16:  ERROR - {e}")
+
+        # PyTorch SDPA baseline (works for all head_dim)
+        try:
+            def run_sdpa():
+                return torch.nn.functional.scaled_dot_product_attention(
+                    q_bf16, k_bf16, v_bf16, scale=scale
+                )
+
+            time_sdpa = benchmark_kernel(run_sdpa)
+            tflops_sdpa = flops / (time_sdpa / 1000) / 1e12
+            print(f"  SDPA:  {time_sdpa:8.3f} ms  ({tflops_sdpa:7.1f} TFLOPS)  [PyTorch baseline]")
+            if time_bf16 is None:
+                time_bf16 = time_sdpa  # Use SDPA as baseline for comparison
         except Exception as e:
-            print(f"  BF16:  ERROR - {e}")
+            print(f"  SDPA:  ERROR - {e}")
 
         # FP8 benchmark (only for head_dim=128)
         if head_dim == 128:
