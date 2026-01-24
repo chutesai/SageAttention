@@ -82,9 +82,10 @@ def main():
         flops = 4 * batch * heads * seqlen * seqlen * head_dim
 
         # BF16 benchmark
+        time_bf16 = None
         try:
             def run_bf16():
-                return fmha_sm100.fwd_bf16(q_bf16, k_bf16, v_bf16, None, False, scale)
+                return fmha_sm100.fwd_bf16(q_bf16, k_bf16, v_bf16, False, scale)
 
             time_bf16 = benchmark_kernel(run_bf16)
             tflops_bf16 = flops / (time_bf16 / 1000) / 1e12
@@ -92,20 +93,21 @@ def main():
         except Exception as e:
             print(f"  BF16:  ERROR - {e}")
 
-        # FP8 benchmark
-        try:
-            q_fp8 = q_bf16.to(torch.float8_e4m3fn)
-            k_fp8 = k_bf16.to(torch.float8_e4m3fn)
-            v_fp8 = v_bf16.to(torch.float8_e4m3fn)
+        # FP8 benchmark (only for head_dim=128)
+        if head_dim == 128:
+            try:
+                q_fp8 = q_bf16.to(torch.float8_e4m3fn)
+                k_fp8 = k_bf16.to(torch.float8_e4m3fn)
+                v_fp8 = v_bf16.to(torch.float8_e4m3fn)
 
-            def run_fp8():
-                return fmha_sm100.fwd_fp8(q_fp8, k_fp8, v_fp8, None, False, scale)
+                def run_fp8():
+                    return fmha_sm100.fwd_fp8(q_fp8, k_fp8, v_fp8, False, scale)
 
-            time_fp8 = benchmark_kernel(run_fp8)
-            tflops_fp8 = flops / (time_fp8 / 1000) / 1e12
-            print(f"  FP8:   {time_fp8:8.3f} ms  ({tflops_fp8:7.1f} TFLOPS)")
-        except Exception as e:
-            print(f"  FP8:   ERROR - {e}")
+                time_fp8 = benchmark_kernel(run_fp8)
+                tflops_fp8 = flops / (time_fp8 / 1000) / 1e12
+                print(f"  FP8:   {time_fp8:8.3f} ms  ({tflops_fp8:7.1f} TFLOPS)")
+            except Exception as e:
+                print(f"  FP8:   ERROR - {e}")
 
         # FP4 benchmark (only for head_dim=256)
         if head_dim == 256:
@@ -123,7 +125,7 @@ def main():
                 print(f"  FP4:   {time_fp4:8.3f} ms  ({tflops_fp4:7.1f} TFLOPS)")
 
                 # Show speedup/slowdown
-                if 'time_bf16' in dir():
+                if time_bf16 is not None:
                     ratio = time_fp4 / time_bf16
                     if ratio > 1:
                         print(f"         (FP4 is {ratio:.1f}x SLOWER than BF16 - scalar fallback)")
