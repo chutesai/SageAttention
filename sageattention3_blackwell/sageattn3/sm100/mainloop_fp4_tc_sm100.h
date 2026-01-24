@@ -25,19 +25,10 @@
 #include <cmath>
 
 #include "cute/tensor.hpp"
-#include "cute/algorithm/gemm.hpp"
-#include "cute/algorithm/copy.hpp"
-#include "cute/arch/mma_sm100.hpp"
-#include "cute/arch/mma_sm100_desc.hpp"
-#include "cute/arch/mma_sm100_umma.hpp"
-#include "cute/atom/mma_traits_sm100.hpp"
-#include "cute/arch/tmem.hpp"
-#include "cute/arch/tmem_allocator_sm100.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/float_subbyte.h"
 #include "cutlass/float8.h"
-#include "cutlass/detail/sm100_blockscaled_layout.hpp"
 
 #include "kernel_traits_fp4.h"
 
@@ -105,38 +96,6 @@ struct Flash_fwd_kernel_traits_sm100_fp4_tcgen05 {
     static constexpr int SmemSizeSFQ = kBlockM * NumSFPerHead;  // 2KB
     static constexpr int SmemSizeSFK = kBlockN * NumSFPerHead;  // 4KB
     static constexpr int SmemSizeSFV = kBlockN * NumSFPerHead;  // 4KB
-
-    // Swizzle pattern for 128-bit (16-byte) access
-    // FP4 packed data: 32 bytes covers 64 elements = 1 MMA K iteration
-    using SwizzleQ = Swizzle<3, 4, 3>;  // 128B swizzle for Q
-    using SwizzleK = Swizzle<3, 4, 3>;  // 128B swizzle for K
-    using SwizzleV = Swizzle<3, 4, 3>;  // 128B swizzle for V
-
-    // SMEM layout for Q: (kBlockM, kHeadDim/2) with swizzle
-    // Row = query index, Col = packed FP4 bytes
-    using SmemLayoutQ = decltype(
-        composition(
-            SwizzleQ{},
-            make_layout(
-                make_shape(Int<kBlockM>{}, Int<kHeadDim/2>{}),
-                make_stride(Int<kHeadDim/2>{}, Int<1>{})
-            )
-        )
-    );
-
-    // SMEM layout for K: (kBlockN, kHeadDim/2) with swizzle
-    using SmemLayoutK = decltype(
-        composition(
-            SwizzleK{},
-            make_layout(
-                make_shape(Int<kBlockN>{}, Int<kHeadDim/2>{}),
-                make_stride(Int<kHeadDim/2>{}, Int<1>{})
-            )
-        )
-    );
-
-    // SMEM layout for V: same as K
-    using SmemLayoutV = SmemLayoutK;
 
     // Shared storage - K and V share space (staged loading)
     struct SharedStorage {
