@@ -109,12 +109,21 @@ def test_fp4_correctness():
         # Reference attention with dequantized values
         ref_out = reference_attention(q_deq, k_deq, v_deq, scale)
 
-        # Run FP4 kernel
+        # Run FP4 kernel (original)
         try:
             fp4_out = fmha_sm100.fwd_fp4(q_data, q_sf, k_data, k_sf, v_data, v_sf, None, False, scale)
         except Exception as e:
             print(f"  ERROR: Kernel failed: {e}")
             continue
+
+        # Also test optimized kernel
+        try:
+            fp4_out_opt = fmha_sm100.fwd_fp4_opt(q_data, q_sf, k_data, k_sf, v_data, v_sf, None, False, scale)
+            has_opt = True
+        except Exception as e:
+            print(f"  WARNING: Optimized kernel failed: {e}")
+            fp4_out_opt = None
+            has_opt = False
 
         # Compare outputs
         fp4_out_float = fp4_out.float()
@@ -152,11 +161,30 @@ def test_fp4_correctness():
 
         # Pass/Fail
         if correlation > 0.99:
-            print("  STATUS: PASS")
+            print("  STATUS: PASS (scalar)")
         elif correlation > 0.95:
             print("  STATUS: MARGINAL (correlation < 0.99)")
         else:
             print("  STATUS: FAIL (correlation < 0.95)")
+
+        # Test optimized kernel if available
+        if has_opt and fp4_out_opt is not None:
+            fp4_opt_float = fp4_out_opt.float()
+            if not torch.isnan(fp4_opt_float).any() and not torch.isinf(fp4_opt_float).any():
+                fp4_opt_flat = fp4_opt_float.flatten().cpu()
+                fp4_opt_mean = fp4_opt_flat.mean()
+                fp4_opt_centered = fp4_opt_flat - fp4_opt_mean
+                corr_opt = (fp4_opt_centered * ref_centered).sum() / (fp4_opt_centered.norm() * ref_centered.norm() + 1e-8)
+                corr_opt = corr_opt.item()
+                print(f"  Optimized correlation: {corr_opt:.6f}")
+                if corr_opt > 0.99:
+                    print("  STATUS: PASS (optimized)")
+                elif corr_opt > 0.95:
+                    print("  STATUS: MARGINAL (optimized, correlation < 0.99)")
+                else:
+                    print("  STATUS: FAIL (optimized, correlation < 0.95)")
+            else:
+                print("  Optimized kernel output contains NaN/Inf")
 
 def test_causal_mask():
     """Test causal masking."""

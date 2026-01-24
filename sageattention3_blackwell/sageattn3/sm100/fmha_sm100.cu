@@ -134,6 +134,7 @@ using FmhaFP8Causal = FmhaKernelFP8<MaskCausal>;
 #include "kernel_traits_fp4.h"
 #include "kernel_fp4_ws.h"
 #include "mainloop_fp4_mma.h"  // CuTe TiledMMA interface for tensor cores
+#include "mainloop_fp4_tc_sm100.h"  // High-performance tensor core implementation
 
 using ElementFP4 = cutlass::float_e2m1_t;
 using ElementFP4SF = cutlass::float_e4m3_t;  // Signed E4M3 to match PyTorch float8_e4m3fn
@@ -205,6 +206,20 @@ struct FmhaKernelFP4Mma {
     using Kernel = flash::Sm100FlashFwdKernelFP4Mma<Ktraits, Is_causal, TileScheduler>;
 };
 
+// FP4 tcgen05 variant - high-performance optimized SMEM-based implementation
+template <bool Is_causal>
+struct FmhaKernelFP4Tcgen05 {
+    using Ktraits = flash::Flash_fwd_kernel_traits_sm100_fp4_tcgen05<
+        256,   // kHeadDim (must be 256 for FP4)
+        128,   // kBlockM (matches MMA M size)
+        256,   // kBlockN (must be 256 for FP4 PV matmul)
+        ElementFP4Out
+    >;
+
+    using TileScheduler = flash::SimpleTileSchedulerFP4;
+    using Kernel = flash::Sm100FlashFwdKernelFP4TensorCore<Ktraits, Is_causal, TileScheduler>;
+};
+
 using FmhaFP4NoMask = FmhaKernelFP4<false>;
 using FmhaFP4Causal = FmhaKernelFP4<true>;
 using FmhaFP4TCNoMask = FmhaKernelFP4TC<false>;
@@ -213,6 +228,8 @@ using FmhaFP4TensorNoMask = FmhaKernelFP4TensorOpt<false>;
 using FmhaFP4TensorCausal = FmhaKernelFP4TensorOpt<true>;
 using FmhaFP4MmaNoMask = FmhaKernelFP4Mma<false>;
 using FmhaFP4MmaCausal = FmhaKernelFP4Mma<true>;
+using FmhaFP4Tcgen05NoMask = FmhaKernelFP4Tcgen05<false>;
+using FmhaFP4Tcgen05Causal = FmhaKernelFP4Tcgen05<true>;
 
 // Forward declaration of FP4 kernel wrapper
 template <typename Kernel>
@@ -751,6 +768,44 @@ torch::Tensor fmha_fwd_fp4(
         q_data, q_sf, k_data, k_sf, v_data, v_sf, delta_s_ptr, scale);
 }
 
+// FP4 optimized forward pass using tcgen05 tensor core implementation
+// This is the high-performance variant with SMEM staging and vectorized loads
+torch::Tensor fmha_fwd_fp4_opt(
+    torch::Tensor q_data,      // FP4 packed as uint8
+    torch::Tensor q_sf,        // FP8 E4M3 scale factors
+    torch::Tensor k_data,
+    torch::Tensor k_sf,
+    torch::Tensor v_data,
+    torch::Tensor v_sf,
+    c10::optional<torch::Tensor> delta_s,  // Optional smooth attention correction
+    bool is_causal,
+    float scale
+) {
+    TORCH_CHECK(q_data.is_cuda(), "Q data must be on CUDA");
+    TORCH_CHECK(q_sf.is_cuda(), "Q scale factors must be on CUDA");
+    TORCH_CHECK(k_data.is_cuda(), "K data must be on CUDA");
+    TORCH_CHECK(k_sf.is_cuda(), "K scale factors must be on CUDA");
+    TORCH_CHECK(v_data.is_cuda(), "V data must be on CUDA");
+    TORCH_CHECK(v_sf.is_cuda(), "V scale factors must be on CUDA");
+
+    at::cuda::CUDAGuard device_guard(q_data.device());
+
+    // Handle optional delta_s
+    torch::Tensor* delta_s_ptr = nullptr;
+    torch::Tensor delta_s_tensor;
+    if (delta_s.has_value()) {
+        delta_s_tensor = delta_s.value();
+        delta_s_ptr = &delta_s_tensor;
+    }
+
+    if (is_causal) {
+        return run_fmha_fp4_impl<FmhaFP4Tcgen05Causal>(
+            q_data, q_sf, k_data, k_sf, v_data, v_sf, delta_s_ptr, scale);
+    }
+    return run_fmha_fp4_impl<FmhaFP4Tcgen05NoMask>(
+        q_data, q_sf, k_data, k_sf, v_data, v_sf, delta_s_ptr, scale);
+}
+
 // Auto-quantize BF16 to FP4 and run FP4 attention
 // NOTE: This pads HeadDim from 128 to 256 if needed
 torch::Tensor fmha_fwd_fp4_from_bf16(
@@ -891,6 +946,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "SM100 Flash MHA Forward (FP4 block-scaled, 7x theoretical speedup)\n"
           "NOTE: Requires HeadDim=256, input must be pre-quantized FP4 with scale factors\n"
           "delta_s: Optional smooth attention correction tensor [batch, heads, num_q_groups, seqlen_k]",
+          py::arg("q_data"), py::arg("q_sf"),
+          py::arg("k_data"), py::arg("k_sf"),
+          py::arg("v_data"), py::arg("v_sf"),
+          py::arg("delta_s") = py::none(),
+          py::arg("is_causal") = false, py::arg("scale") = 1.0f);
+    m.def("fwd_fp4_opt", &fmha_fwd_fp4_opt,
+          "SM100 Flash MHA Forward (FP4 optimized, SMEM staging + vectorized loads)\n"
+          "NOTE: Requires HeadDim=256, input must be pre-quantized FP4 with scale factors\n"
+          "This is the high-performance variant with cooperative SMEM loading",
           py::arg("q_data"), py::arg("q_sf"),
           py::arg("k_data"), py::arg("k_sf"),
           py::arg("v_data"), py::arg("v_sf"),

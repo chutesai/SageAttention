@@ -137,21 +137,46 @@ def main():
 
                 time_fp4 = benchmark_kernel(run_fp4)
                 tflops_fp4 = flops / (time_fp4 / 1000) / 1e12
-                print(f"  FP4:   {time_fp4:8.3f} ms  ({tflops_fp4:7.1f} TFLOPS)")
+                print(f"  FP4:   {time_fp4:8.3f} ms  ({tflops_fp4:7.1f} TFLOPS)  [scalar]")
 
                 # Show speedup/slowdown
                 if time_bf16 is not None:
                     ratio = time_fp4 / time_bf16
                     if ratio > 1:
-                        print(f"         (FP4 is {ratio:.1f}x SLOWER than BF16 - scalar fallback)")
+                        print(f"         (FP4 is {ratio:.1f}x SLOWER than baseline)")
                     else:
-                        print(f"         (FP4 is {1/ratio:.1f}x FASTER than BF16)")
+                        print(f"         (FP4 is {1/ratio:.1f}x FASTER than baseline)")
             except Exception as e:
                 print(f"  FP4:   ERROR - {e}")
 
+            # FP4 optimized benchmark
+            try:
+                def run_fp4_opt():
+                    return fmha_sm100.fwd_fp4_opt(q_data, q_sf, k_data, k_sf, v_data, v_sf, None, False, scale)
+
+                time_fp4_opt = benchmark_kernel(run_fp4_opt)
+                tflops_fp4_opt = flops / (time_fp4_opt / 1000) / 1e12
+                print(f"  FP4opt:{time_fp4_opt:8.3f} ms  ({tflops_fp4_opt:7.1f} TFLOPS)  [SMEM staging]")
+
+                # Show speedup vs scalar
+                if time_fp4 > 0:
+                    speedup = time_fp4 / time_fp4_opt
+                    print(f"         ({speedup:.1f}x speedup vs scalar FP4)")
+
+                # Show speedup vs baseline
+                if time_bf16 is not None:
+                    ratio = time_fp4_opt / time_bf16
+                    if ratio > 1:
+                        print(f"         (FP4opt is {ratio:.1f}x SLOWER than baseline)")
+                    else:
+                        print(f"         (FP4opt is {1/ratio:.1f}x FASTER than baseline)")
+            except Exception as e:
+                print(f"  FP4opt:ERROR - {e}")
+
     print("\n" + "=" * 70)
     print("Notes:")
-    print("- FP4 currently uses scalar fallback (no tensor cores yet)")
+    print("- FP4 scalar: original implementation (global memory access)")
+    print("- FP4opt: optimized with SMEM staging and vectorized loads")
     print("- Target: FP4 should be faster than BF16 with tensor cores")
     print("- HeadDim=256 required for FP4 (MMA K=64 constraint)")
     print("=" * 70)
