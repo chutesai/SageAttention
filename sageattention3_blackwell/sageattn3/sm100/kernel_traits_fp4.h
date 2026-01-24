@@ -91,76 +91,55 @@ struct Flash_fwd_kernel_traits_sm100_fp4 {
     using ClusterShape_MNK = Shape<Int<kClusterM>, _1, _1>;
 
     //=========================================================================
-    // MMA Tile Permissions
+    // MMA Tile Configuration
     //=========================================================================
 
-    // For kBlockM=128: 8 atoms along M, for kBlockM=256: 4 atoms (2SM mode)
-    using PermTileM = decltype(cute::min(Int<kBlockM>{}, _128{}));
-    using PermTileN = _32;
-    using PermTileK = Int<kHeadDim>;
+    // SM100_MMA_MXF4_SS has fixed M=128, so:
+    // - For kBlockM=128: 1 atom along M
+    // - For kBlockM=256: 2 atoms along M (requires multi-SM cluster or iteration)
+    //
+    // The N dimension of the MMA is configurable (8-256, multiple of 8)
+    // We use N=128 to match kBlockN
 
-    using AtomLayoutMNK = std::conditional_t<kBlockM == 128,
-                                            Layout<Shape<_8, _1, _1>>,
-                                            Layout<Shape<_4, _1, _1>>>;
+    // For kBlockM=128, one MMA atom covers the entire M dimension
+    // For kBlockM=256, we need 2 atoms along M
+    static constexpr int NumMmaAtomsM = kBlockM / 128;
+    static constexpr int NumMmaAtomsN = kBlockN / 128;  // N=128 per atom
+
+    using AtomLayoutMNK = Layout<Shape<Int<NumMmaAtomsM>, Int<NumMmaAtomsN>, _1>>;
+
+    // The permutation tile describes how to tile the compute over the MMA atoms
+    using PermTileM = _128;  // MMA atom M size
+    using PermTileN = _128;  // MMA atom N size
+    using PermTileK = Int<kHeadDim>;
 
     //=========================================================================
     // TiledMma Definitions - Direct construction like SM120
     //
     // SM100 uses SM100_MMA_MXF4_SS for FP4 block-scaled MMA
     // The MMA atom shape is (M, N, K) where K=64 for FP4 (256 bits / 4 bits)
+    //
+    // NOTE: These are defined but not currently used in the simplified
+    // scalar mainloop. Full tensor core implementation will use these.
     //=========================================================================
 
     // For QK GEMM: A=Q (row-major), B=K^T (col-major, i.e., K transposed)
     // SM100_MMA_MXF4_SS<a_type, b_type, c_type, sf_type, M, N, VS, a_major, b_major, a_neg, b_neg>
     // where:
-    //   - M, N are the MMA tile dimensions
-    //   - VS = SFVectorSize (16)
+    //   - M, N are the MMA tile dimensions (M=128 fixed, N=8-256)
+    //   - VS = SFVectorSize (16 or 32)
     //   - a_major = UMMA::Major::K (row-major A)
     //   - b_major = UMMA::Major::K (col-major B)
     //   - a_neg, b_neg = UMMA::ScaleIn::One (no negation)
 
-    // MMA atom for FP4 block-scaled: 64x128x64 (M x N x K) - K=64 elements for FP4
-    using MMA_Atom_QK = SM100_MMA_MXF4_SS<
-        Element,                    // a_type (FP4 E2M1)
-        Element,                    // b_type (FP4 E2M1)
-        ElementAccum,               // c_type (FP32)
-        ElementSF,                  // sf_type (E4M3)
-        64,                         // M
-        128,                        // N
-        SFVectorSize,               // VS = 16
-        UMMA::Major::K,             // a_major (row-major A = Q)
-        UMMA::Major::K,             // b_major (col-major B = K^T)
-        UMMA::ScaleIn::One,         // a_neg (no negation)
-        UMMA::ScaleIn::One          // b_neg (no negation)
-    >;
-
-    using TiledMmaQK = decltype(cute::make_tiled_mma(
-        MMA_Atom_QK{},
-        AtomLayoutMNK{},
-        Tile<PermTileM, PermTileN, PermTileK>{}
-    ));
-
-    // For PV GEMM: A=P (row-major), B=V (col-major after transpose)
-    // Note: V needs to be stored transposed for col-major access
-    using MMA_Atom_PV = SM100_MMA_MXF4_SS<
-        Element,                    // a_type (FP4)
-        Element,                    // b_type (FP4)
-        ElementAccum,               // c_type (FP32)
-        ElementSF,                  // sf_type (E4M3)
-        64,                         // M
-        128,                        // N
-        SFVectorSize,               // VS = 16
-        UMMA::Major::K,             // a_major (row-major A = P)
-        UMMA::Major::K,             // b_major (col-major B = Vt)
-        UMMA::ScaleIn::One,
-        UMMA::ScaleIn::One
-    >;
-
-    using TiledMmaPV = decltype(cute::make_tiled_mma(
-        MMA_Atom_PV{},
-        AtomLayoutMNK{},
-        Tile<PermTileM, _32, PermTileK>{}
-    ));
+    // Placeholder types for future tensor core implementation
+    // The actual MMA will be:
+    // SM100_MMA_MXF4_SS<Element, Element, ElementAccum, ElementSF,
+    //                   128, 128, SFVectorSize,
+    //                   UMMA::Major::K, UMMA::Major::K,
+    //                   UMMA::ScaleIn::One, UMMA::ScaleIn::One>
+    using TiledMmaQK = void;  // Placeholder - will be properly defined for tensor core impl
+    using TiledMmaPV = void;  // Placeholder - will be properly defined for tensor core impl
 
     //=========================================================================
     // Scale Factor Configuration
