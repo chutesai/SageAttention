@@ -173,10 +173,29 @@ struct FmhaKernelFP4TC {
     using Kernel = flash::Sm100FlashFwdKernelFP4TC<Ktraits, Is_causal, TileScheduler>;
 };
 
+// FP4 Tensor Optimized variant - best performance with cooperative SMEM staging
+template <bool Is_causal>
+struct FmhaKernelFP4TensorOpt {
+    using Ktraits = flash::Flash_fwd_kernel_traits_sm100_fp4_tensor<
+        256,   // kHeadDim (must be 256 for FP4)
+        128,   // kBlockM
+        256,   // kBlockN
+        2,     // kStages
+        1,     // kClusterM
+        false, // BlockMean
+        ElementFP4Out
+    >;
+
+    using TileScheduler = flash::SimpleTileSchedulerFP4;
+    using Kernel = flash::Sm100FlashFwdKernelFP4TensorOpt<Ktraits, Is_causal, TileScheduler>;
+};
+
 using FmhaFP4NoMask = FmhaKernelFP4<false>;
 using FmhaFP4Causal = FmhaKernelFP4<true>;
 using FmhaFP4TCNoMask = FmhaKernelFP4TC<false>;
 using FmhaFP4TCCausal = FmhaKernelFP4TC<true>;
+using FmhaFP4TensorNoMask = FmhaKernelFP4TensorOpt<false>;
+using FmhaFP4TensorCausal = FmhaKernelFP4TensorOpt<true>;
 
 // Forward declaration of FP4 kernel wrapper
 template <typename Kernel>
