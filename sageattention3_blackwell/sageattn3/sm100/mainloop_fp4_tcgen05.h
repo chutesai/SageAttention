@@ -271,21 +271,38 @@ struct CollectiveMainloopFwdSm100FP4Tcgen05 {
 
     ///////////////////////////////////////////////////////////////////////////
     // FP4 Decode - (nibble - 7.5) * 0.8
+    // Optimized with LUT and vectorized operations
     ///////////////////////////////////////////////////////////////////////////
 
+    // LUT for FP4 decode: value[i] = (i - 7.5) * 0.8
+    static constexpr float FP4_LUT[16] = {
+        -6.0f, -5.2f, -4.4f, -3.6f, -2.8f, -2.0f, -1.2f, -0.4f,
+         0.4f,  1.2f,  2.0f,  2.8f,  3.6f,  4.4f,  5.2f,  6.0f
+    };
+
     CUTLASS_DEVICE static float decode_nibble(uint8_t nibble) {
-        return (static_cast<float>(nibble) - 7.5f) * 0.8f;
+        return FP4_LUT[nibble & 0x0F];
     }
 
+    // Decode 8 FP4 values from a 32-bit word using LUT
     CUTLASS_DEVICE static void decode_fp4_vec4(uint32_t packed4, float out[8]) {
-        out[0] = decode_nibble((packed4 >> 0) & 0x0F);
-        out[1] = decode_nibble((packed4 >> 4) & 0x0F);
-        out[2] = decode_nibble((packed4 >> 8) & 0x0F);
-        out[3] = decode_nibble((packed4 >> 12) & 0x0F);
-        out[4] = decode_nibble((packed4 >> 16) & 0x0F);
-        out[5] = decode_nibble((packed4 >> 20) & 0x0F);
-        out[6] = decode_nibble((packed4 >> 24) & 0x0F);
-        out[7] = decode_nibble((packed4 >> 28) & 0x0F);
+        out[0] = FP4_LUT[(packed4 >>  0) & 0x0F];
+        out[1] = FP4_LUT[(packed4 >>  4) & 0x0F];
+        out[2] = FP4_LUT[(packed4 >>  8) & 0x0F];
+        out[3] = FP4_LUT[(packed4 >> 12) & 0x0F];
+        out[4] = FP4_LUT[(packed4 >> 16) & 0x0F];
+        out[5] = FP4_LUT[(packed4 >> 20) & 0x0F];
+        out[6] = FP4_LUT[(packed4 >> 24) & 0x0F];
+        out[7] = FP4_LUT[(packed4 >> 28) & 0x0F];
+    }
+
+    // Fast 8-element dot product with FMA
+    CUTLASS_DEVICE static float dot8_fma(const float a[8], const float b[8]) {
+        float sum = __fmaf_rn(a[0], b[0], __fmaf_rn(a[1], b[1],
+                   __fmaf_rn(a[2], b[2], __fmaf_rn(a[3], b[3],
+                   __fmaf_rn(a[4], b[4], __fmaf_rn(a[5], b[5],
+                   __fmaf_rn(a[6], b[6], a[7] * b[7])))))));
+        return sum;
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -506,7 +523,7 @@ struct CollectiveMainloopFwdSm100FP4Tcgen05 {
     }
 
     ///////////////////////////////////////////////////////////////////////////
-    // QK Dot Product - Scalar implementation with scale factors
+    // QK Dot Product - Optimized scalar with LUT decode and FMA
     // This computes S = Q @ K^T with block-scaled FP4 inputs
     ///////////////////////////////////////////////////////////////////////////
 
@@ -518,43 +535,49 @@ struct CollectiveMainloopFwdSm100FP4Tcgen05 {
         const int num_bytes_per_row = kHeadDim / 2;
         float score = 0.0f;
 
+        // Prefetch scale factors
+        float q_scales[NumSFPerHead];
+        float k_scales[NumSFPerHead];
+
+        #pragma unroll
+        for (int sf = 0; sf < NumSFPerHead; ++sf) {
+            q_scales[sf] = static_cast<float>(storage.smem_SFQ[q_row * NumSFPerHead + sf]);
+            k_scales[sf] = static_cast<float>(storage.smem_SFK[k_col * NumSFPerHead + sf]);
+        }
+
         #pragma unroll
         for (int sf_block = 0; sf_block < NumSFPerHead; ++sf_block) {
             int d_start = sf_block * SFVectorSize;
-
-            float q_scale = static_cast<float>(storage.smem_SFQ[q_row * NumSFPerHead + sf_block]);
-            float k_scale = static_cast<float>(storage.smem_SFK[k_col * NumSFPerHead + sf_block]);
-            float combined_scale = q_scale * k_scale;
+            float combined_scale = q_scales[sf_block] * k_scales[sf_block];
 
             int q_byte_base = q_row * num_bytes_per_row + d_start / 2;
             int k_byte_base = k_col * num_bytes_per_row + d_start / 2;
 
+            // Load 8 bytes (16 FP4 values) at once
             uint32_t q_vec0 = *reinterpret_cast<uint32_t const*>(&storage.smem_Q[q_byte_base]);
             uint32_t q_vec1 = *reinterpret_cast<uint32_t const*>(&storage.smem_Q[q_byte_base + 4]);
             uint32_t k_vec0 = *reinterpret_cast<uint32_t const*>(&storage.smem_K[k_byte_base]);
             uint32_t k_vec1 = *reinterpret_cast<uint32_t const*>(&storage.smem_K[k_byte_base + 4]);
 
-            float block_sum = 0.0f;
             float q0[8], k0[8], q1[8], k1[8];
 
+            // Decode using LUT
             decode_fp4_vec4(q_vec0, q0);
             decode_fp4_vec4(k_vec0, k0);
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) block_sum += q0[i] * k0[i];
-
             decode_fp4_vec4(q_vec1, q1);
             decode_fp4_vec4(k_vec1, k1);
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) block_sum += q1[i] * k1[i];
 
-            score += block_sum * combined_scale;
+            // Compute dot product with FMA
+            float block_sum = dot8_fma(q0, k0) + dot8_fma(q1, k1);
+
+            score = __fmaf_rn(block_sum, combined_scale, score);
         }
 
         return score;
     }
 
     ///////////////////////////////////////////////////////////////////////////
-    // PV Accumulation with scale factors
+    // PV Accumulation with scale factors - Optimized with FMA
     ///////////////////////////////////////////////////////////////////////////
 
     CUTLASS_DEVICE static void accumulate_pv(
@@ -565,11 +588,17 @@ struct CollectiveMainloopFwdSm100FP4Tcgen05 {
     ) {
         const int num_bytes_per_row = kHeadDim / 2;
 
+        // Prefetch scale factors
+        float v_scales[NumSFPerHead];
+        #pragma unroll
+        for (int sf = 0; sf < NumSFPerHead; ++sf) {
+            v_scales[sf] = static_cast<float>(storage.smem_SFV[v_col * NumSFPerHead + sf]);
+        }
+
         #pragma unroll
         for (int sf_block = 0; sf_block < NumSFPerHead; ++sf_block) {
             int d_start = sf_block * SFVectorSize;
-            float v_scale = static_cast<float>(storage.smem_SFV[v_col * NumSFPerHead + sf_block]);
-            float scaled_weight = weight * v_scale;
+            float scaled_weight = weight * v_scales[sf_block];
 
             int v_byte_base = v_col * num_bytes_per_row + d_start / 2;
 
@@ -580,10 +609,11 @@ struct CollectiveMainloopFwdSm100FP4Tcgen05 {
             decode_fp4_vec4(v_vec0, v0);
             decode_fp4_vec4(v_vec1, v1);
 
+            // Use FMA for accumulation
             #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                thread_output[d_start + i] += scaled_weight * v0[i];
-                thread_output[d_start + 8 + i] += scaled_weight * v1[i];
+                thread_output[d_start + i] = __fmaf_rn(scaled_weight, v0[i], thread_output[d_start + i]);
+                thread_output[d_start + 8 + i] = __fmaf_rn(scaled_weight, v1[i], thread_output[d_start + 8 + i]);
             }
         }
     }
