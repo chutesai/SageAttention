@@ -136,6 +136,7 @@ using FmhaFP8Causal = FmhaKernelFP8<MaskCausal>;
 #include "mainloop_fp4_mma.h"  // CuTe TiledMMA interface for tensor cores
 #include "mainloop_fp4_tc_sm100.h"  // High-performance tensor core implementation
 #include "mainloop_fp4_cute_mma.h"  // CuTe-based MMA implementation
+#include "mainloop_fp4_tcgen05.h"   // TCGen05 optimized implementation
 
 using ElementFP4 = cutlass::float_e2m1_t;
 using ElementFP4SF = cutlass::float_e4m3_t;  // Signed E4M3 to match PyTorch float8_e4m3fn
@@ -218,7 +219,7 @@ struct FmhaKernelFP4Tcgen05 {
     >;
 
     using TileScheduler = flash::SimpleTileSchedulerFP4;
-    using Kernel = flash::Sm100FlashFwdKernelFP4TensorCore<Ktraits, Is_causal, TileScheduler>;
+    using Kernel = flash::Sm100FlashFwdKernelFP4Tcgen05<Ktraits, Is_causal, TileScheduler>;
 };
 
 // FP4 CuTe MMA variant - CuTe-based implementation for future tensor core MMA integration
