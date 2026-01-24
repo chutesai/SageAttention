@@ -818,6 +818,15 @@ struct Sm100FlashFwdKernelFP4Tcgen05 {
         return dim3(kNThreads, 1, 1);
     }
 
+    // Aliases for compatibility with fmha_sm100.cu launch code
+    static dim3 get_grid_dim(Arguments const& args, int /* sm_count */) {
+        return get_grid_shape(args);
+    }
+
+    static dim3 get_block_dim() {
+        return get_block_shape();
+    }
+
     static size_t get_smem_size() {
         return sizeof(SharedStorage);
     }
