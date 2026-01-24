@@ -4,14 +4,8 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * SM100 (B200/B300) FP4 Block-Scaled Flash Attention - Tensor Core Mainloop
  *
- * High-performance implementation using SM100 tcgen05.mma tensor core instructions
- * for FP4 block-scaled attention with E4M3 scale factors.
- *
- * Architecture:
- * - Uses SM100_MMA_MXF4_SS for FP4 block-scaled GEMM operations
- * - SMEM staging for Q/K/V data and scale factors
- * - Warp-cooperative data loading with proper synchronization
- * - Online softmax with rescaling for numerical stability
+ * High-performance implementation using SMEM staging for better memory access.
+ * The FP4 data is loaded cooperatively to SMEM, then processed from SMEM.
  *
  * Key constraints:
  * - HeadDim = 256 (MMA K dimension requirement for FP4)
@@ -28,13 +22,6 @@
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/float_subbyte.h"
 #include "cutlass/float8.h"
-#include "cutlass/pipeline/pipeline.hpp"
-
-// SM100 MMA infrastructure
-#include "cute/arch/mma_sm100.hpp"
-#include "cute/arch/mma_sm100_umma.hpp"
-#include "cute/atom/mma_traits_sm100.hpp"
-#include "cutlass/detail/sm100_blockscaled_layout.hpp"
 
 #include "kernel_traits_fp4.h"
 
@@ -43,92 +30,7 @@ namespace flash {
 using namespace cute;
 
 ///////////////////////////////////////////////////////////////////////////////
-// Kernel Traits for Tensor Core FP4 Implementation
-///////////////////////////////////////////////////////////////////////////////
-
-template <
-    int kHeadDim_,
-    int kBlockM_,
-    int kBlockN_,
-    int kStages_,
-    typename ElementOut_ = cutlass::bfloat16_t
->
-struct Flash_fwd_kernel_traits_sm100_fp4_tensor {
-    // Configuration
-    static constexpr int kHeadDim = kHeadDim_;
-    static constexpr int kBlockM = kBlockM_;
-    static constexpr int kBlockN = kBlockN_;
-    static constexpr int kStages = kStages_;
-
-    // Element types
-    using Element = cutlass::float_e2m1_t;           // FP4 E2M1
-    using ElementSF = cutlass::float_e4m3_t;         // Scale factor E4M3
-    using ElementAccum = float;                       // FP32 accumulator
-    using ElementOut = ElementOut_;                   // Output (BF16)
-    using index_t = int64_t;
-
-    // Scale factor configuration
-    static constexpr int SFVectorSize = 16;
-    static constexpr int NumSFPerHead = kHeadDim / SFVectorSize;
-    static constexpr int NumSFPerBlockN = kBlockN / SFVectorSize;
-
-    // MMA configuration for SM100 FP4
-    // SM100_MMA_MXF4_SS: M=128 fixed, N=8-256, K=64 (256 bits / 4 bits)
-    static constexpr int kMmaM = 128;
-    static constexpr int kMmaN = 128;  // Match with block size
-    static constexpr int kMmaK = 64;   // FP4 MMA K dimension
-
-    static constexpr int kMmaIterM = kBlockM / kMmaM;
-    static constexpr int kMmaIterN = kBlockN / kMmaN;
-    static constexpr int kMmaIterK = kHeadDim / kMmaK;
-
-    // Thread configuration - use 4 warps for tensor core implementation
-    static constexpr int kNWarps = 4;
-    static constexpr int kNThreads = kNWarps * 32;  // 128 threads
-
-    // Tile shapes
-    using TileShape_MNK = Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
-
-    // SMEM sizes (FP4 packed = 2 values per byte)
-    static constexpr int SmemSizeQ = kBlockM * kHeadDim / 2;
-    static constexpr int SmemSizeK = kBlockN * kHeadDim / 2;
-    static constexpr int SmemSizeV = kBlockN * kHeadDim / 2;
-    static constexpr int SmemSizeSFQ = kBlockM * NumSFPerHead;
-    static constexpr int SmemSizeSFK = kBlockN * NumSFPerHead;
-    static constexpr int SmemSizeSFV = kBlockN * NumSFPerHead;
-
-    // Scratch space for softmax (row_max, row_sum, etc.)
-    static constexpr int SmemSizeScratch = kBlockM * 4 * sizeof(float);
-
-    // Total SMEM with alignment
-    static constexpr int SmemSizeTotal =
-        ((SmemSizeQ + 127) / 128 * 128) +
-        ((SmemSizeK + 127) / 128 * 128) +
-        ((SmemSizeV + 127) / 128 * 128) +
-        ((SmemSizeSFQ + 127) / 128 * 128) +
-        ((SmemSizeSFK + 127) / 128 * 128) +
-        ((SmemSizeSFV + 127) / 128 * 128) +
-        ((SmemSizeScratch + 127) / 128 * 128);
-
-    // Shared storage structure
-    struct SharedStorage {
-        // FP4 data tiles (packed)
-        alignas(128) uint8_t smem_Q[SmemSizeQ];
-        alignas(128) uint8_t smem_K[SmemSizeK];
-        alignas(128) uint8_t smem_V[SmemSizeV];
-
-        // Scale factor tiles
-        alignas(128) ElementSF smem_SFQ[SmemSizeSFQ];
-        alignas(128) ElementSF smem_SFK[SmemSizeSFK];
-        alignas(128) ElementSF smem_SFV[SmemSizeSFV];
-
-        // Scratch for softmax
-        alignas(128) float smem_scratch[kBlockM * 4];
-    };
-};
-
-///////////////////////////////////////////////////////////////////////////////
-// Mask implementations
+// Mask implementations for Tensor Optimized Variant
 ///////////////////////////////////////////////////////////////////////////////
 
 struct FP4TensorCausalMask {
@@ -162,6 +64,10 @@ struct FP4TensorNoMask {
 
 ///////////////////////////////////////////////////////////////////////////////
 // SM100 FP4 Block-Scaled Flash Attention - Tensor Core Mainloop
+//
+// This implementation stages data in SMEM for better memory access patterns.
+// All threads cooperatively load Q/K/V data to SMEM, then each thread
+// processes its assigned rows.
 ///////////////////////////////////////////////////////////////////////////////
 
 template <typename Ktraits, bool Is_causal>
@@ -176,18 +82,12 @@ struct CollectiveMainloopFwdSm100FP4Tensor {
 
     using Mask = std::conditional_t<Is_causal, FP4TensorCausalMask, FP4TensorNoMask>;
 
-    // Constants
+    // Constants from traits
     static constexpr int kBlockM = Ktraits::kBlockM;
     static constexpr int kBlockN = Ktraits::kBlockN;
     static constexpr int kHeadDim = Ktraits::kHeadDim;
     static constexpr int SFVectorSize = Ktraits::SFVectorSize;
     static constexpr int kNThreads = Ktraits::kNThreads;
-
-    // MMA configuration
-    static constexpr int kMmaM = Ktraits::kMmaM;
-    static constexpr int kMmaN = Ktraits::kMmaN;
-    static constexpr int kMmaK = Ktraits::kMmaK;
-    static constexpr int kMmaIterK = Ktraits::kMmaIterK;
 
     // Scale factor dimensions
     static constexpr int NumSFPerHead = kHeadDim / SFVectorSize;
@@ -284,6 +184,7 @@ struct CollectiveMainloopFwdSm100FP4Tensor {
     ///////////////////////////////////////////////////////////////////////////
 
     CUTLASS_DEVICE static float decode_fp4(uint8_t packed, int which) {
+        // Linear FP4 decoding: value = (nibble - 7.5) * 0.8
         uint8_t nibble = which ? (packed >> 4) : (packed & 0x0F);
         return (static_cast<float>(nibble) - 7.5f) * 0.8f;
     }
@@ -306,7 +207,6 @@ struct CollectiveMainloopFwdSm100FP4Tensor {
 
         int thread_idx = threadIdx.x;
         int row_start = m_block * BlockM;
-        int rows_this_tile = min(BlockM, seqlen_q - row_start);
 
         auto Q_data = reinterpret_cast<uint8_t const*>(params.ptr_Q);
 
@@ -375,7 +275,6 @@ struct CollectiveMainloopFwdSm100FP4Tensor {
 
         int thread_idx = threadIdx.x;
         int col_start = n_tile * BlockN;
-        int cols_this_tile = min(BlockN, seqlen_k - col_start);
 
         auto K_data = reinterpret_cast<uint8_t const*>(params.ptr_K);
 
@@ -570,7 +469,7 @@ struct CollectiveMainloopFwdSm100FP4Tensor {
     }
 
     ///////////////////////////////////////////////////////////////////////////
-    // Main Kernel Body - Optimized with SMEM staging
+    // Main Kernel Body
     ///////////////////////////////////////////////////////////////////////////
 
     CUTLASS_DEVICE void operator()(
@@ -605,7 +504,7 @@ struct CollectiveMainloopFwdSm100FP4Tensor {
         load_q_tile(params, storage, m_block, head_idx, batch_idx, seqlen_q);
         __syncthreads();
 
-        // Each thread handles one row (for now - will be optimized later)
+        // Each thread handles one row
         int my_row = thread_idx % BlockM;
         if (my_row >= rows_this_tile) {
             // Participate in barriers but don't compute
@@ -646,7 +545,7 @@ struct CollectiveMainloopFwdSm100FP4Tensor {
             load_k_tile(params, storage, n_tile, head_idx, batch_idx, seqlen_k);
             __syncthreads();
 
-            // Load V tile to SMEM (cooperative) - can overlap with QK compute
+            // Load V tile to SMEM (cooperative)
             load_v_tile(params, storage, n_tile, head_idx, batch_idx, seqlen_k);
             __syncthreads();
 
@@ -707,141 +606,6 @@ struct CollectiveMainloopFwdSm100FP4Tensor {
         for (int d = 0; d < HeadDim; ++d) {
             O_base[d] = static_cast<ElementOut>(thread_output[d]);
         }
-    }
-};
-
-///////////////////////////////////////////////////////////////////////////////
-// SM100 FP4 Flash Attention Kernel - Tensor Core Optimized
-///////////////////////////////////////////////////////////////////////////////
-
-template <typename Ktraits_, bool Is_causal, typename TileScheduler>
-struct Sm100FlashFwdKernelFP4Tensor {
-
-    using Ktraits = Ktraits_;
-
-    using Element = typename Ktraits::Element;
-    using ElementSF = typename Ktraits::ElementSF;
-    using ElementOut = typename Ktraits::ElementOut;
-    using ElementAccum = typename Ktraits::ElementAccum;
-
-    using TileShape_MNK = typename Ktraits::TileShape_MNK;
-    using SharedStorage = typename Ktraits::SharedStorage;
-
-    using CollectiveMainloop = CollectiveMainloopFwdSm100FP4Tensor<Ktraits, Is_causal>;
-
-    static constexpr int kBlockM = Ktraits::kBlockM;
-    static constexpr int kBlockN = Ktraits::kBlockN;
-    static constexpr int kHeadDim = Ktraits::kHeadDim;
-    static constexpr int kNThreads = Ktraits::kNThreads;
-
-    // Kernel Arguments
-    struct Arguments {
-        int seqlen_q;
-        int seqlen_k;
-        int head_dim;
-        int num_heads;
-        int batch_size;
-
-        Element const* ptr_Q;
-        ElementSF const* ptr_SFQ;
-        int64_t stride_Q_seq;
-        int64_t stride_Q_head;
-        int64_t stride_Q_batch;
-
-        Element const* ptr_K;
-        ElementSF const* ptr_SFK;
-        int64_t stride_K_seq;
-        int64_t stride_K_head;
-        int64_t stride_K_batch;
-
-        Element const* ptr_V;
-        ElementSF const* ptr_SFV;
-        int64_t stride_V_seq;
-        int64_t stride_V_head;
-        int64_t stride_V_batch;
-
-        ElementOut* ptr_O;
-        int64_t stride_O_seq;
-        int64_t stride_O_head;
-        int64_t stride_O_batch;
-
-        float const* ptr_delta_s;
-        int64_t stride_ds_k;
-        int64_t stride_ds_group;
-        int64_t stride_ds_head;
-        int64_t stride_ds_batch;
-        bool use_smooth_attention;
-
-        float scale_softmax;
-    };
-
-    struct Params {
-        typename CollectiveMainloop::Params mainloop;
-        typename TileScheduler::Params scheduler;
-        int seqlen_q;
-        int seqlen_k;
-        int num_heads;
-        int batch_size;
-    };
-
-    static Params to_underlying_arguments(Arguments const& args, void* workspace) {
-        auto problem_shape = make_tuple(
-            args.seqlen_q, args.seqlen_k, args.head_dim,
-            make_tuple(args.num_heads, args.batch_size)
-        );
-
-        auto mainloop_params = CollectiveMainloop::to_underlying_arguments(args, workspace);
-
-        typename TileScheduler::Arguments scheduler_args{};
-        auto scheduler_params = TileScheduler::to_underlying_arguments(
-            problem_shape, TileShape_MNK{}, scheduler_args, workspace);
-
-        return Params{
-            mainloop_params,
-            scheduler_params,
-            args.seqlen_q,
-            args.seqlen_k,
-            args.num_heads,
-            args.batch_size
-        };
-    }
-
-    static dim3 get_grid_dim(Arguments const& args, int sm_count) {
-        int num_m_blocks = (args.seqlen_q + kBlockM - 1) / kBlockM;
-        int num_tiles = num_m_blocks * args.num_heads * args.batch_size;
-        return dim3(min(num_tiles, sm_count), 1, 1);
-    }
-
-    static dim3 get_block_dim() {
-        return dim3(kNThreads, 1, 1);
-    }
-
-    static size_t get_smem_size() {
-        return sizeof(SharedStorage);
-    }
-
-    CUTLASS_DEVICE void operator()(Params const& params, char* smem) {
-        SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem);
-
-        TileScheduler scheduler;
-        auto work_tile = scheduler.get_initial_work(params.scheduler);
-
-        if (!work_tile.is_valid()) {
-            return;
-        }
-
-        auto [m_block, head_idx, batch_idx] = work_tile.get_block_coord();
-
-        CollectiveMainloop mainloop;
-        mainloop(
-            params.mainloop,
-            shared_storage,
-            m_block,
-            head_idx,
-            batch_idx,
-            params.seqlen_q,
-            params.seqlen_k
-        );
     }
 };
 
