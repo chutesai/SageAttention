@@ -270,30 +270,25 @@ struct CollectiveMainloopFwdSm100FP4Tcgen05 {
     }
 
     ///////////////////////////////////////////////////////////////////////////
-    // FP4 Decode - (nibble - 7.5) * 0.8
-    // Optimized with LUT and vectorized operations
+    // FP4 Decode Helpers - Optimized with inline decode and FMA
+    // Formula: value = (nibble - 7.5) * 0.8
     ///////////////////////////////////////////////////////////////////////////
 
-    // LUT for FP4 decode: value[i] = (i - 7.5) * 0.8
-    static constexpr float FP4_LUT[16] = {
-        -6.0f, -5.2f, -4.4f, -3.6f, -2.8f, -2.0f, -1.2f, -0.4f,
-         0.4f,  1.2f,  2.0f,  2.8f,  3.6f,  4.4f,  5.2f,  6.0f
-    };
-
+    // Inline FP4 decode: value = (nibble - 7.5) * 0.8
     CUTLASS_DEVICE static float decode_nibble(uint8_t nibble) {
-        return FP4_LUT[nibble & 0x0F];
+        return (static_cast<float>(nibble & 0x0F) - 7.5f) * 0.8f;
     }
 
-    // Decode 8 FP4 values from a 32-bit word using LUT
+    // Decode 8 FP4 values from a 32-bit word
     CUTLASS_DEVICE static void decode_fp4_vec4(uint32_t packed4, float out[8]) {
-        out[0] = FP4_LUT[(packed4 >>  0) & 0x0F];
-        out[1] = FP4_LUT[(packed4 >>  4) & 0x0F];
-        out[2] = FP4_LUT[(packed4 >>  8) & 0x0F];
-        out[3] = FP4_LUT[(packed4 >> 12) & 0x0F];
-        out[4] = FP4_LUT[(packed4 >> 16) & 0x0F];
-        out[5] = FP4_LUT[(packed4 >> 20) & 0x0F];
-        out[6] = FP4_LUT[(packed4 >> 24) & 0x0F];
-        out[7] = FP4_LUT[(packed4 >> 28) & 0x0F];
+        out[0] = (static_cast<float>((packed4 >>  0) & 0x0F) - 7.5f) * 0.8f;
+        out[1] = (static_cast<float>((packed4 >>  4) & 0x0F) - 7.5f) * 0.8f;
+        out[2] = (static_cast<float>((packed4 >>  8) & 0x0F) - 7.5f) * 0.8f;
+        out[3] = (static_cast<float>((packed4 >> 12) & 0x0F) - 7.5f) * 0.8f;
+        out[4] = (static_cast<float>((packed4 >> 16) & 0x0F) - 7.5f) * 0.8f;
+        out[5] = (static_cast<float>((packed4 >> 20) & 0x0F) - 7.5f) * 0.8f;
+        out[6] = (static_cast<float>((packed4 >> 24) & 0x0F) - 7.5f) * 0.8f;
+        out[7] = (static_cast<float>((packed4 >> 28) & 0x0F) - 7.5f) * 0.8f;
     }
 
     // Fast 8-element dot product with FMA
