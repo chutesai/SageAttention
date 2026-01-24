@@ -670,20 +670,26 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
         int seqlen_q,
         int seqlen_k
     ) {
+        // Local constexpr copies to avoid CUDA device code ODR issues
+        constexpr int HeadDim = Ktraits::kHeadDim;
+        constexpr int BlockM = Ktraits::kBlockM;
+        constexpr int BlockN = Ktraits::kBlockN;
+        constexpr int NThreads = Ktraits::kNThreads;
+
         int thread_idx = threadIdx.x;
 
         // Problem shape for mask
-        auto problem_shape = make_tuple(seqlen_q, seqlen_k, kHeadDim, make_tuple(1, 1));
+        auto problem_shape = make_tuple(seqlen_q, seqlen_k, HeadDim, make_tuple(1, 1));
 
         // Calculate number of K/V tiles
         Mask mask;
         auto blk_coord = make_tuple(m_block, 0, make_tuple(head_idx, batch_idx));
-        int num_kv_tiles = mask.get_trip_count(blk_coord, make_tuple(kBlockM, kBlockN, kHeadDim), problem_shape);
+        int num_kv_tiles = mask.get_trip_count(blk_coord, make_tuple(BlockM, BlockN, HeadDim), problem_shape);
 
         if (num_kv_tiles <= 0) return;
 
-        int row_start = m_block * kBlockM;
-        int rows_this_tile = min(kBlockM, seqlen_q - row_start);
+        int row_start = m_block * BlockM;
+        int rows_this_tile = min(BlockM, seqlen_q - row_start);
 
         // Load Q tile to SMEM (resident for all K/V tiles)
         load_q_tile_cooperative(params, storage, m_block, head_idx, batch_idx, seqlen_q);
@@ -691,15 +697,15 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
 
         // Initialize output accumulator and softmax state in SMEM
         // Each thread handles multiple rows for parallel initialization
-        int rows_per_thread = (kBlockM + kNThreads - 1) / kNThreads;
+        int rows_per_thread = (BlockM + NThreads - 1) / NThreads;
         for (int r = 0; r < rows_per_thread; ++r) {
             int row = thread_idx * rows_per_thread + r;
-            if (row < kBlockM) {
+            if (row < BlockM) {
                 storage.smem_row_max[row] = -INFINITY;
                 storage.smem_row_sum[row] = 0.0f;
                 #pragma unroll 4
-                for (int d = 0; d < kHeadDim; ++d) {
-                    storage.smem_O[row * kHeadDim + d] = 0.0f;
+                for (int d = 0; d < HeadDim; ++d) {
+                    storage.smem_O[row * HeadDim + d] = 0.0f;
                 }
             }
         }
@@ -717,12 +723,12 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
 
         // Thread-row assignment: threads are distributed across query rows
         // Defined outside loop so it's visible for output write
-        int thread_row = thread_idx % kBlockM;
+        int thread_row = thread_idx % BlockM;
 
         // Process each K/V tile
         for (int n_tile = 0; n_tile < num_kv_tiles; ++n_tile) {
-            int tile_col_start = n_tile * kBlockN;
-            int tile_cols = min(kBlockN, seqlen_k - tile_col_start);
+            int tile_col_start = n_tile * BlockN;
+            int tile_cols = min(BlockN, seqlen_k - tile_col_start);
 
             // Load K tile to SMEM
             load_k_tile_cooperative(params, storage, n_tile, head_idx, batch_idx, seqlen_k);
@@ -733,7 +739,7 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
 
                 // Compute tile scores and find tile max
                 float tile_max = -INFINITY;
-                float tile_scores[kBlockN];  // Store all scores for this tile
+                float tile_scores[256];  // Fixed size for BlockN=256
 
                 for (int j = 0; j < tile_cols; ++j) {
                     int global_col = tile_col_start + j;
@@ -766,8 +772,8 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
                     float scale_factor = expf(old_max - new_max);
                     storage.smem_row_sum[thread_row] *= scale_factor;
                     #pragma unroll 4
-                    for (int d = 0; d < kHeadDim; ++d) {
-                        storage.smem_O[thread_row * kHeadDim + d] *= scale_factor;
+                    for (int d = 0; d < HeadDim; ++d) {
+                        storage.smem_O[thread_row * HeadDim + d] *= scale_factor;
                     }
                 }
 
@@ -807,7 +813,7 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
                     storage.smem_row_sum[thread_row] += weight;
 
                     // Accumulate PV
-                    accumulate_pv_optimized(storage, &storage.smem_O[thread_row * kHeadDim], j, weight);
+                    accumulate_pv_optimized(storage, &storage.smem_O[thread_row * HeadDim], j, weight);
                 }
             }
 
@@ -826,8 +832,8 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
                 global_row * params.stride_O_seq;
 
             #pragma unroll 4
-            for (int d = 0; d < kHeadDim; ++d) {
-                O_base[d] = static_cast<ElementOut>(storage.smem_O[thread_row * kHeadDim + d] * inv_row_sum);
+            for (int d = 0; d < HeadDim; ++d) {
+                O_base[d] = static_cast<ElementOut>(storage.smem_O[thread_row * HeadDim + d] * inv_row_sum);
             }
         }
     }
