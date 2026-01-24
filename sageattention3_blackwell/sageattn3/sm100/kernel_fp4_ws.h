@@ -35,12 +35,12 @@ struct Sm100FlashFwdKernelFP4 {
     // Expose Ktraits for external access
     using Ktraits = Ktraits_;
 
-    using ElementData = typename Ktraits::ElementData;
+    using Element = typename Ktraits::Element;
     using ElementSF = typename Ktraits::ElementSF;
     using ElementOut = typename Ktraits::ElementOut;
     using ElementAccum = typename Ktraits::ElementAccum;
 
-    using TileShapeQK = typename Ktraits::TileShapeQK;
+    using TileShape_MNK = typename Ktraits::TileShape_MNK;
     using SharedStorage = typename Ktraits::SharedStorage;
 
     using CollectiveMainloop = CollectiveMainloopFwdSm100FP4<Ktraits, Is_causal>;
@@ -63,21 +63,21 @@ struct Sm100FlashFwdKernelFP4 {
         int batch_size;
 
         // FP4 Q tensor and scale factors
-        ElementData const* ptr_Q;
+        Element const* ptr_Q;
         ElementSF const* ptr_SFQ;
         int64_t stride_Q_seq;
         int64_t stride_Q_head;
         int64_t stride_Q_batch;
 
         // FP4 K tensor and scale factors
-        ElementData const* ptr_K;
+        Element const* ptr_K;
         ElementSF const* ptr_SFK;
         int64_t stride_K_seq;
         int64_t stride_K_head;
         int64_t stride_K_batch;
 
         // FP4 V tensor and scale factors
-        ElementData const* ptr_V;
+        Element const* ptr_V;
         ElementSF const* ptr_SFV;
         int64_t stride_V_seq;
         int64_t stride_V_head;
@@ -122,7 +122,7 @@ struct Sm100FlashFwdKernelFP4 {
 
         typename TileScheduler::Arguments scheduler_args{};
         auto scheduler_params = TileScheduler::to_underlying_arguments(
-            problem_shape, TileShapeQK{}, scheduler_args, workspace);
+            problem_shape, TileShape_MNK{}, scheduler_args, workspace);
 
         return Params{
             mainloop_params,
