@@ -274,12 +274,53 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
     }
 
     ///////////////////////////////////////////////////////////////////////////
-    // FP4 Decode Helper (for verification and fallback)
+    // FP4 Decode Helpers - Optimized versions
     ///////////////////////////////////////////////////////////////////////////
 
+    // Standard decode for single nibble
     CUTLASS_DEVICE static float decode_fp4(uint8_t packed, int which) {
         uint8_t nibble = which ? (packed >> 4) : (packed & 0x0F);
         return (static_cast<float>(nibble) - 7.5f) * 0.8f;
+    }
+
+    // Lookup table for FP4 decode (computed at compile time conceptually)
+    // LUT[i] = (i - 7.5) * 0.8 for i in [0, 15]
+    // Values: -6, -5.2, -4.4, -3.6, -2.8, -2.0, -1.2, -0.4, 0.4, 1.2, 2.0, 2.8, 3.6, 4.4, 5.2, 6.0
+    static constexpr float FP4_LUT[16] = {
+        -6.0f, -5.2f, -4.4f, -3.6f, -2.8f, -2.0f, -1.2f, -0.4f,
+         0.4f,  1.2f,  2.0f,  2.8f,  3.6f,  4.4f,  5.2f,  6.0f
+    };
+
+    // Decode using LUT - faster than arithmetic
+    CUTLASS_DEVICE static float decode_fp4_lut(uint8_t packed, int which) {
+        uint8_t nibble = which ? (packed >> 4) : (packed & 0x0F);
+        return FP4_LUT[nibble];
+    }
+
+    // Decode a full byte to 2 floats using LUT
+    CUTLASS_DEVICE static void decode_fp4_byte(uint8_t packed, float& out0, float& out1) {
+        out0 = FP4_LUT[packed & 0x0F];
+        out1 = FP4_LUT[packed >> 4];
+    }
+
+    // Vectorized decode of 4 bytes (8 FP4 values) to 8 floats
+    CUTLASS_DEVICE static void decode_fp4_vec4(
+        uint32_t packed4,  // 4 packed bytes
+        float out[8]
+    ) {
+        uint8_t b0 = packed4 & 0xFF;
+        uint8_t b1 = (packed4 >> 8) & 0xFF;
+        uint8_t b2 = (packed4 >> 16) & 0xFF;
+        uint8_t b3 = (packed4 >> 24) & 0xFF;
+
+        out[0] = FP4_LUT[b0 & 0x0F];
+        out[1] = FP4_LUT[b0 >> 4];
+        out[2] = FP4_LUT[b1 & 0x0F];
+        out[3] = FP4_LUT[b1 >> 4];
+        out[4] = FP4_LUT[b2 & 0x0F];
+        out[5] = FP4_LUT[b2 >> 4];
+        out[6] = FP4_LUT[b3 & 0x0F];
+        out[7] = FP4_LUT[b3 >> 4];
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -571,7 +612,7 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
 
     ///////////////////////////////////////////////////////////////////////////
     // Compute QK dot product from SMEM
-    // Optimized with loop unrolling and register blocking
+    // Highly optimized with LUT decode and vectorized loads
     ///////////////////////////////////////////////////////////////////////////
 
     CUTLASS_DEVICE static float compute_qk_dot_optimized(
@@ -580,10 +621,9 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
         int k_col
     ) {
         const int num_bytes_per_row = kHeadDim / 2;
-
         float score = 0.0f;
 
-        // Unroll over scale factor blocks
+        // Process all 16 scale factor blocks (HeadDim=256, SFVectorSize=16)
         #pragma unroll
         for (int sf_block = 0; sf_block < NumSFPerHead; ++sf_block) {
             int d_start = sf_block * SFVectorSize;
@@ -592,29 +632,39 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
             float k_scale = static_cast<float>(storage.smem_SFK[k_col * NumSFPerHead + sf_block]);
             float combined_scale = q_scale * k_scale;
 
-            // Accumulate 8 products at a time (4 bytes = 8 FP4 values)
-            float block_sum0 = 0.0f;
-            float block_sum1 = 0.0f;
+            // Each scale factor block covers 16 FP4 values = 8 bytes
+            // Process 8 bytes (16 FP4 values) with vectorized loads
+            int q_byte_base = q_row * num_bytes_per_row + d_start / 2;
+            int k_byte_base = k_col * num_bytes_per_row + d_start / 2;
 
+            // Load 8 bytes as two uint32_t for better memory bandwidth
+            uint32_t q_vec0 = *reinterpret_cast<uint32_t const*>(&storage.smem_Q[q_byte_base]);
+            uint32_t q_vec1 = *reinterpret_cast<uint32_t const*>(&storage.smem_Q[q_byte_base + 4]);
+            uint32_t k_vec0 = *reinterpret_cast<uint32_t const*>(&storage.smem_K[k_byte_base]);
+            uint32_t k_vec1 = *reinterpret_cast<uint32_t const*>(&storage.smem_K[k_byte_base + 4]);
+
+            // Decode and dot product using LUT
+            float block_sum = 0.0f;
+
+            // First 8 FP4 values
+            float q0[8], k0[8];
+            decode_fp4_vec4(q_vec0, q0);
+            decode_fp4_vec4(k_vec0, k0);
             #pragma unroll
-            for (int dd = 0; dd < SFVectorSize; dd += 4) {
-                int dim_idx = d_start + dd;
-                int q_byte_idx = q_row * num_bytes_per_row + dim_idx / 2;
-                int k_byte_idx = k_col * num_bytes_per_row + dim_idx / 2;
-
-                // Load 2 bytes (4 FP4 values) at a time
-                uint8_t q_byte0 = storage.smem_Q[q_byte_idx];
-                uint8_t q_byte1 = storage.smem_Q[q_byte_idx + 1];
-                uint8_t k_byte0 = storage.smem_K[k_byte_idx];
-                uint8_t k_byte1 = storage.smem_K[k_byte_idx + 1];
-
-                // Decode and multiply
-                block_sum0 += decode_fp4(q_byte0, 0) * decode_fp4(k_byte0, 0);
-                block_sum0 += decode_fp4(q_byte0, 1) * decode_fp4(k_byte0, 1);
-                block_sum1 += decode_fp4(q_byte1, 0) * decode_fp4(k_byte1, 0);
-                block_sum1 += decode_fp4(q_byte1, 1) * decode_fp4(k_byte1, 1);
+            for (int i = 0; i < 8; ++i) {
+                block_sum += q0[i] * k0[i];
             }
-            score += (block_sum0 + block_sum1) * combined_scale;
+
+            // Second 8 FP4 values
+            float q1[8], k1[8];
+            decode_fp4_vec4(q_vec1, q1);
+            decode_fp4_vec4(k_vec1, k1);
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                block_sum += q1[i] * k1[i];
+            }
+
+            score += block_sum * combined_scale;
         }
 
         return score;
@@ -622,7 +672,7 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
 
     ///////////////////////////////////////////////////////////////////////////
     // Accumulate weighted V from SMEM
-    // Optimized with register blocking
+    // Highly optimized with LUT decode and vectorized loads
     ///////////////////////////////////////////////////////////////////////////
 
     CUTLASS_DEVICE static void accumulate_pv_optimized(
@@ -639,18 +689,26 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
             float v_scale = static_cast<float>(storage.smem_SFV[v_col * NumSFPerHead + sf_block]);
             float scaled_weight = weight * v_scale;
 
+            int v_byte_base = v_col * num_bytes_per_row + d_start / 2;
+
+            // Load 8 bytes (16 FP4 values) as two uint32_t
+            uint32_t v_vec0 = *reinterpret_cast<uint32_t const*>(&storage.smem_V[v_byte_base]);
+            uint32_t v_vec1 = *reinterpret_cast<uint32_t const*>(&storage.smem_V[v_byte_base + 4]);
+
+            // Decode first 8 values and accumulate
+            float v0[8];
+            decode_fp4_vec4(v_vec0, v0);
             #pragma unroll
-            for (int dd = 0; dd < SFVectorSize; dd += 4) {
-                int dim_idx = d_start + dd;
-                int v_byte_idx = v_col * num_bytes_per_row + dim_idx / 2;
+            for (int i = 0; i < 8; ++i) {
+                thread_output[d_start + i] += scaled_weight * v0[i];
+            }
 
-                uint8_t v_byte0 = storage.smem_V[v_byte_idx];
-                uint8_t v_byte1 = storage.smem_V[v_byte_idx + 1];
-
-                thread_output[dim_idx + 0] += scaled_weight * decode_fp4(v_byte0, 0);
-                thread_output[dim_idx + 1] += scaled_weight * decode_fp4(v_byte0, 1);
-                thread_output[dim_idx + 2] += scaled_weight * decode_fp4(v_byte1, 0);
-                thread_output[dim_idx + 3] += scaled_weight * decode_fp4(v_byte1, 1);
+            // Decode second 8 values and accumulate
+            float v1[8];
+            decode_fp4_vec4(v_vec1, v1);
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                thread_output[d_start + 8 + i] += scaled_weight * v1[i];
             }
         }
     }
