@@ -183,14 +183,14 @@ struct CollectiveMainloopFwdSm100FP4 {
     // - Values: ±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6
     ///////////////////////////////////////////////////////////////////////////
 
-    // Lookup table for FP4 E2M1 -> FP32 conversion
-    // Index 0-15 maps to the 16 possible FP4 values
-    static constexpr float fp4_lut[16] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-    };
-
     CUTLASS_DEVICE static float decode_fp4(uint8_t packed, int which) {
+        // Lookup table for FP4 E2M1 -> FP32 conversion
+        // Index 0-15 maps to the 16 possible FP4 values
+        // Defined inside function to avoid CUDA device code issues with static constexpr
+        constexpr float fp4_lut[16] = {
+            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+            -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+        };
         // Extract nibble (which = 0 for low nibble, 1 for high nibble)
         uint8_t nibble = which ? (packed >> 4) : (packed & 0x0F);
         return fp4_lut[nibble];
@@ -209,24 +209,30 @@ struct CollectiveMainloopFwdSm100FP4 {
         int seqlen_q,
         int seqlen_k
     ) {
+        // Local constexpr copies to avoid CUDA device code ODR issues
+        constexpr int HeadDim = Ktraits::kHeadDim;
+        constexpr int BlockM = Ktraits::kBlockM;
+        constexpr int BlockN = Ktraits::kBlockN;
+        constexpr int SFVecSize = Ktraits::SFVectorSize;
+
         int thread_idx = threadIdx.x;
 
         // Problem shape for this tile
-        auto problem_shape = make_tuple(seqlen_q, seqlen_k, kHeadDim,
+        auto problem_shape = make_tuple(seqlen_q, seqlen_k, HeadDim,
                                         make_tuple(1, 1));
 
         // Calculate number of K/V tiles to process
         Mask mask;
         auto blk_coord = make_tuple(m_block, 0, make_tuple(head_idx, batch_idx));
-        int num_kv_tiles = mask.get_trip_count(blk_coord, make_tuple(kBlockM, kBlockN, kHeadDim), problem_shape);
+        int num_kv_tiles = mask.get_trip_count(blk_coord, make_tuple(BlockM, BlockN, HeadDim), problem_shape);
 
         if (num_kv_tiles <= 0) return;
 
-        int row_start = m_block * kBlockM;
-        int rows_this_tile = min(kBlockM, seqlen_q - row_start);
+        int row_start = m_block * BlockM;
+        int rows_this_tile = min(BlockM, seqlen_q - row_start);
 
         // Which row does this thread handle
-        int my_row = thread_idx % kBlockM;
+        int my_row = thread_idx % BlockM;
         int global_row = row_start + my_row;
 
         if (my_row >= rows_this_tile) {
@@ -235,9 +241,9 @@ struct CollectiveMainloopFwdSm100FP4 {
         }
 
         // Per-thread output accumulator (FP32)
-        float thread_output[kHeadDim];
+        float thread_output[HeadDim];
         CUTLASS_PRAGMA_UNROLL
-        for (int d = 0; d < kHeadDim; ++d) {
+        for (int d = 0; d < HeadDim; ++d) {
             thread_output[d] = 0.0f;
         }
 
@@ -262,27 +268,27 @@ struct CollectiveMainloopFwdSm100FP4 {
 
         // Process K/V tiles
         for (int n_tile = 0; n_tile < num_kv_tiles; ++n_tile) {
-            int col_start = n_tile * kBlockN;
-            int cols_this_tile = min(kBlockN, seqlen_k - col_start);
+            int col_start = n_tile * BlockN;
+            int cols_this_tile = min(BlockN, seqlen_k - col_start);
 
             // =========================================================
             // QK GEMM with block-scaled FP4
             // =========================================================
 
-            float scores[kBlockN];
+            float scores[BlockN];
             CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < kBlockN; ++j) {
+            for (int j = 0; j < BlockN; ++j) {
                 scores[j] = 0.0f;
             }
 
-            // Block-scaled dot product: Q[row,:] @ K[col_start:col_start+kBlockN,:]^T
-            for (int sf_block = 0; sf_block < kHeadDim / SFVectorSize; ++sf_block) {
-                int d_start = sf_block * SFVectorSize;
+            // Block-scaled dot product: Q[row,:] @ K[col_start:col_start+BlockN,:]^T
+            for (int sf_block = 0; sf_block < HeadDim / SFVecSize; ++sf_block) {
+                int d_start = sf_block * SFVecSize;
 
                 // Get Q scale factor for this block
                 int q_sf_offset = (batch_idx * params.stride_Q_batch +
                                    head_idx * params.stride_Q_head +
-                                   global_row * params.stride_Q_seq) / SFVectorSize + sf_block;
+                                   global_row * params.stride_Q_seq) / SFVecSize + sf_block;
                 float q_scale = static_cast<float>(params.ptr_SFQ[q_sf_offset]);
 
                 for (int j = 0; j < cols_this_tile; ++j) {
@@ -291,7 +297,7 @@ struct CollectiveMainloopFwdSm100FP4 {
                     // Get K scale factor for this block
                     int k_sf_offset = (batch_idx * params.stride_K_batch +
                                        head_idx * params.stride_K_head +
-                                       global_col * params.stride_K_seq) / SFVectorSize + sf_block;
+                                       global_col * params.stride_K_seq) / SFVecSize + sf_block;
                     float k_scale = static_cast<float>(params.ptr_SFK[k_sf_offset]);
 
                     // Combined scale factor
@@ -299,7 +305,7 @@ struct CollectiveMainloopFwdSm100FP4 {
 
                     // Accumulate FP4 dot product within this SF block
                     float block_sum = 0.0f;
-                    for (int dd = 0; dd < SFVectorSize; dd += 2) {
+                    for (int dd = 0; dd < SFVecSize; dd += 2) {
                         int dim_idx = d_start + dd;
 
                         // Read packed FP4 values (2 per byte)
@@ -339,7 +345,7 @@ struct CollectiveMainloopFwdSm100FP4 {
             // Apply causal mask if needed
             if constexpr (Is_causal) {
                 CUTLASS_PRAGMA_UNROLL
-                for (int j = 0; j < kBlockN; ++j) {
+                for (int j = 0; j < BlockN; ++j) {
                     int global_col = col_start + j;
                     if (global_col > global_row) {
                         scores[j] = -INFINITY;
@@ -364,7 +370,7 @@ struct CollectiveMainloopFwdSm100FP4 {
             row_sum *= scale_factor;
 
             CUTLASS_PRAGMA_UNROLL
-            for (int d = 0; d < kHeadDim; ++d) {
+            for (int d = 0; d < HeadDim; ++d) {
                 thread_output[d] *= scale_factor;
             }
 
@@ -379,16 +385,16 @@ struct CollectiveMainloopFwdSm100FP4 {
                 // =========================================================
                 int global_col = col_start + j;
 
-                for (int sf_block = 0; sf_block < kHeadDim / SFVectorSize; ++sf_block) {
-                    int d_start = sf_block * SFVectorSize;
+                for (int sf_block = 0; sf_block < HeadDim / SFVecSize; ++sf_block) {
+                    int d_start = sf_block * SFVecSize;
 
                     // Get V scale factor for this block
                     int v_sf_offset = (batch_idx * params.stride_V_batch +
                                        head_idx * params.stride_V_head +
-                                       global_col * params.stride_V_seq) / SFVectorSize + sf_block;
+                                       global_col * params.stride_V_seq) / SFVecSize + sf_block;
                     float v_scale = static_cast<float>(params.ptr_SFV[v_sf_offset]);
 
-                    for (int dd = 0; dd < SFVectorSize; dd += 2) {
+                    for (int dd = 0; dd < SFVecSize; dd += 2) {
                         int dim_idx = d_start + dd;
 
                         // Read packed FP4 V values
@@ -411,7 +417,7 @@ struct CollectiveMainloopFwdSm100FP4 {
         // Normalize output by row_sum
         float inv_row_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
         CUTLASS_PRAGMA_UNROLL
-        for (int d = 0; d < kHeadDim; ++d) {
+        for (int d = 0; d < HeadDim; ++d) {
             thread_output[d] *= inv_row_sum;
         }
 
@@ -422,7 +428,7 @@ struct CollectiveMainloopFwdSm100FP4 {
             global_row * params.stride_O_seq;
 
         CUTLASS_PRAGMA_UNROLL
-        for (int d = 0; d < kHeadDim; ++d) {
+        for (int d = 0; d < HeadDim; ++d) {
             O_base[d] = static_cast<ElementOut>(thread_output[d]);
         }
     }
