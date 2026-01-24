@@ -133,6 +133,7 @@ using FmhaFP8Causal = FmhaKernelFP8<MaskCausal>;
 // Include FP4 kernel headers
 #include "kernel_traits_fp4.h"
 #include "kernel_fp4_ws.h"
+#include "mainloop_fp4_mma.h"  // CuTe TiledMMA interface for tensor cores
 
 using ElementFP4 = cutlass::float_e2m1_t;
 using ElementFP4SF = cutlass::float_e4m3_t;  // Signed E4M3 to match PyTorch float8_e4m3fn
@@ -190,12 +191,28 @@ struct FmhaKernelFP4TensorOpt {
     using Kernel = flash::Sm100FlashFwdKernelFP4TensorOpt<Ktraits, Is_causal, TileScheduler>;
 };
 
+// FP4 MMA variant - uses CuTe TiledMMA interface for future tensor core integration
+template <bool Is_causal>
+struct FmhaKernelFP4Mma {
+    using Ktraits = flash::Flash_fwd_kernel_traits_sm100_fp4_mma<
+        256,   // kHeadDim (must be 256 for FP4)
+        128,   // kBlockM (matches MMA M size)
+        256,   // kBlockN (must be 256 for FP4 PV matmul)
+        ElementFP4Out
+    >;
+
+    using TileScheduler = flash::SimpleTileSchedulerFP4;
+    using Kernel = flash::Sm100FlashFwdKernelFP4Mma<Ktraits, Is_causal, TileScheduler>;
+};
+
 using FmhaFP4NoMask = FmhaKernelFP4<false>;
 using FmhaFP4Causal = FmhaKernelFP4<true>;
 using FmhaFP4TCNoMask = FmhaKernelFP4TC<false>;
 using FmhaFP4TCCausal = FmhaKernelFP4TC<true>;
 using FmhaFP4TensorNoMask = FmhaKernelFP4TensorOpt<false>;
 using FmhaFP4TensorCausal = FmhaKernelFP4TensorOpt<true>;
+using FmhaFP4MmaNoMask = FmhaKernelFP4Mma<false>;
+using FmhaFP4MmaCausal = FmhaKernelFP4Mma<true>;
 
 // Forward declaration of FP4 kernel wrapper
 template <typename Kernel>

@@ -5,18 +5,18 @@
  * SM100 (B200/B300) FP4 Block-Scaled Flash Attention - Tensor Core MMA Mainloop
  *
  * This is a high-performance implementation using SM100 tcgen05.mma tensor core
- * instructions for FP4 block-scaled attention.
+ * instructions for FP4 block-scaled attention via the CuTe TiledMMA interface.
  *
  * Uses:
  * - SM100_MMA_MXF4_SS for FP4 block-scaled GEMM operations
- * - TMEM for scale factors and accumulators
- * - Proper SMEM layouts with swizzling for coalesced access
- * - Warp-cooperative execution
+ * - TMEM for accumulators and scale factors
+ * - Proper SMEM layouts with swizzling for MMA access patterns
+ * - TiledMMA interface for clean MMA execution
  *
  * Key constraints:
  * - HeadDim = 256 (MMA K=64, need 4 MMA iterations)
  * - BlockN = 256 (PV matmul requirement)
- * - Scale factor block size = 16 elements
+ * - Scale factor block size = 16 elements (VS=16 for MXF4NVF4)
  * - M = 128 per MMA (fixed for SM100)
  */
 
@@ -26,6 +26,8 @@
 
 #include "cute/tensor.hpp"
 #include "cute/algorithm/gemm.hpp"
+#include "cute/algorithm/cooperative_copy.hpp"
+#include "cute/arch/tmem_allocator_sm100.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/float_subbyte.h"
@@ -36,7 +38,6 @@
 #include "cute/arch/mma_sm100_desc.hpp"
 #include "cute/arch/mma_sm100_umma.hpp"
 #include "cute/atom/mma_traits_sm100.hpp"
-#include "cutlass/detail/sm100_blockscaled_layout.hpp"
 
 #include "kernel_traits_fp4.h"
 
@@ -45,7 +46,7 @@ namespace flash {
 using namespace cute;
 
 ///////////////////////////////////////////////////////////////////////////////
-// SM100 FP4 Kernel Traits for Tensor Core MMA Implementation
+// SM100 FP4 Kernel Traits for CuTe TiledMMA Implementation
 ///////////////////////////////////////////////////////////////////////////////
 
 template <
@@ -72,29 +73,30 @@ struct Flash_fwd_kernel_traits_sm100_fp4_mma {
     using index_t = int64_t;
 
     // Scale factor configuration
-    static constexpr int SFVectorSize = 16;  // 16 elements per scale factor
+    static constexpr int SFVectorSize = 16;  // 16 elements per scale factor (VS=16)
     static constexpr int NumSFPerHead = kHeadDim / SFVectorSize;  // 16
     static constexpr int NumSFPerBlockN = kBlockN / SFVectorSize;  // 16
 
-    // MMA configuration for SM100 FP4
-    // SM100_MMA_MXF4_SS: M=128 fixed, N=8-256, K=64
+    // MMA configuration for SM100 FP4 (SM100_MMA_MXF4_SS with VS=16)
+    // M=128 fixed, N=128 per MMA, K=64 (FP4 K dimension)
     static constexpr int kMmaM = 128;
-    static constexpr int kMmaN = 128;  // Process 128 columns per MMA
-    static constexpr int kMmaK = 64;   // FP4 K dimension (256 bits / 4 bits)
+    static constexpr int kMmaN = 128;
+    static constexpr int kMmaK = 64;
 
     // Number of MMA iterations
     static constexpr int kMmaIterK = kHeadDim / kMmaK;  // 4 iterations for HeadDim=256
     static constexpr int kMmaIterN = kBlockN / kMmaN;   // 2 iterations for BlockN=256
 
-    // Thread configuration - 128 threads (4 warps)
+    // Thread configuration - single warp for MMA (elect_one_sync pattern)
+    // Other threads do cooperative loads
     static constexpr int kNWarps = 4;
     static constexpr int kNThreads = kNWarps * 32;
 
     // Tile shapes
     using TileShape_MNK = Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
 
-    // SMEM sizes (FP4 packed = 2 values per byte, with alignment for swizzle)
-    // Need 128-byte alignment and proper layout for MMA
+    // SMEM sizes for FP4 packed data (2 values per byte)
+    // With 128-byte alignment for proper swizzle patterns
     static constexpr int SmemSizeQ = kBlockM * kHeadDim / 2;  // 16KB
     static constexpr int SmemSizeK = kBlockN * kHeadDim / 2;  // 32KB
     static constexpr int SmemSizeV = kBlockN * kHeadDim / 2;  // 32KB
@@ -104,22 +106,10 @@ struct Flash_fwd_kernel_traits_sm100_fp4_mma {
     static constexpr int SmemSizeSFK = kBlockN * NumSFPerHead;  // 4KB
     static constexpr int SmemSizeSFV = kBlockN * NumSFPerHead;  // 4KB
 
-    // S matrix accumulator (FP32, BlockM x BlockN)
-    static constexpr int SmemSizeS = kBlockM * kBlockN * sizeof(float);  // 128KB
-
-    // Scratch for softmax stats (row_max, row_sum per row)
+    // Scratch for softmax stats
     static constexpr int SmemSizeScratch = kBlockM * 4 * sizeof(float);
 
-    // Total SMEM requirement - this is large!
-    // For practical use, we need to stage K/V loads and reuse SMEM
-    static constexpr int SmemSizeTotal =
-        ((SmemSizeQ + 127) / 128 * 128) +
-        ((SmemSizeK + 127) / 128 * 128) +
-        ((SmemSizeSFQ + 127) / 128 * 128) +
-        ((SmemSizeSFK + 127) / 128 * 128) +
-        ((SmemSizeScratch + 127) / 128 * 128);
-
-    // Shared storage - use union for K/V to save space
+    // Shared storage - K and V share space (staged loading)
     struct SharedStorage {
         // Q tile stays resident
         alignas(128) uint8_t smem_Q[SmemSizeQ];
@@ -137,10 +127,14 @@ struct Flash_fwd_kernel_traits_sm100_fp4_mma {
             };
         };
 
-        // Scratch for softmax and intermediate results
+        // Scratch for softmax and barrier
         alignas(128) float smem_scratch[kBlockM * 4];
 
-        // S accumulator (stored in registers, not SMEM for performance)
+        // TMEM base pointer storage
+        alignas(16) uint32_t tmem_base_ptr;
+
+        // MMA barrier for synchronization
+        alignas(16) uint64_t mma_barrier;
     };
 };
 
@@ -178,10 +172,11 @@ struct FP4MmaNoMask {
 };
 
 ///////////////////////////////////////////////////////////////////////////////
-// SM100 FP4 Block-Scaled Flash Attention - Tensor Core MMA Mainloop
+// SM100 FP4 Block-Scaled Flash Attention - CuTe TiledMMA Mainloop
 //
-// This implementation uses the actual SM100 tensor core MMA infrastructure
-// for high-performance FP4 attention.
+// This implementation uses CuTe's TiledMMA interface with SM100_MMA_MXF4_SS
+// for high-performance FP4 attention. Currently uses scalar fallback for
+// compute while the TMEM/UTCCP infrastructure is being developed.
 ///////////////////////////////////////////////////////////////////////////////
 
 template <typename Ktraits, bool Is_causal>
@@ -295,7 +290,7 @@ struct CollectiveMainloopFwdSm100FP4Mma {
     }
 
     ///////////////////////////////////////////////////////////////////////////
-    // FP4 Decode Helper (fallback for non-MMA paths)
+    // FP4 Decode Helper (scalar fallback)
     ///////////////////////////////////////////////////////////////////////////
 
     CUTLASS_DEVICE static float decode_fp4(uint8_t packed, int which) {
@@ -324,7 +319,8 @@ struct CollectiveMainloopFwdSm100FP4Mma {
         const int total_q_bytes = kBlockM * num_bytes_per_row;
         const int bytes_per_thread = (total_q_bytes + kNThreads - 1) / kNThreads;
 
-        // Load Q data with vectorized loads where possible
+        // Load Q data cooperatively
+        #pragma unroll 4
         for (int i = 0; i < bytes_per_thread; ++i) {
             int byte_idx = thread_idx * bytes_per_thread + i;
             if (byte_idx < total_q_bytes) {
@@ -351,6 +347,7 @@ struct CollectiveMainloopFwdSm100FP4Mma {
         const int sf_q_head_stride = seqlen_q * NumSFPerHead;
         const int sf_q_batch_stride = params.num_heads * sf_q_head_stride;
 
+        #pragma unroll 4
         for (int i = 0; i < sf_per_thread; ++i) {
             int sf_idx = thread_idx * sf_per_thread + i;
             if (sf_idx < total_q_sf) {
@@ -387,6 +384,7 @@ struct CollectiveMainloopFwdSm100FP4Mma {
         const int total_k_bytes = kBlockN * num_bytes_per_row;
         const int bytes_per_thread = (total_k_bytes + kNThreads - 1) / kNThreads;
 
+        #pragma unroll 4
         for (int i = 0; i < bytes_per_thread; ++i) {
             int byte_idx = thread_idx * bytes_per_thread + i;
             if (byte_idx < total_k_bytes) {
@@ -413,6 +411,7 @@ struct CollectiveMainloopFwdSm100FP4Mma {
         const int sf_k_head_stride = seqlen_k * NumSFPerHead;
         const int sf_k_batch_stride = params.num_heads * sf_k_head_stride;
 
+        #pragma unroll 4
         for (int i = 0; i < sf_per_thread; ++i) {
             int sf_idx = thread_idx * sf_per_thread + i;
             if (sf_idx < total_k_sf) {
@@ -449,6 +448,7 @@ struct CollectiveMainloopFwdSm100FP4Mma {
         const int total_v_bytes = kBlockN * num_bytes_per_row;
         const int bytes_per_thread = (total_v_bytes + kNThreads - 1) / kNThreads;
 
+        #pragma unroll 4
         for (int i = 0; i < bytes_per_thread; ++i) {
             int byte_idx = thread_idx * bytes_per_thread + i;
             if (byte_idx < total_v_bytes) {
@@ -475,6 +475,7 @@ struct CollectiveMainloopFwdSm100FP4Mma {
         const int sf_v_head_stride = seqlen_k * NumSFPerHead;
         const int sf_v_batch_stride = params.num_heads * sf_v_head_stride;
 
+        #pragma unroll 4
         for (int i = 0; i < sf_per_thread; ++i) {
             int sf_idx = thread_idx * sf_per_thread + i;
             if (sf_idx < total_v_sf) {
@@ -496,7 +497,7 @@ struct CollectiveMainloopFwdSm100FP4Mma {
 
     ///////////////////////////////////////////////////////////////////////////
     // Compute QK dot product from SMEM (scalar fallback)
-    // TODO: Replace with tensor core MMA
+    // TODO: Replace with SM100_MMA_MXF4_SS tensor core MMA
     ///////////////////////////////////////////////////////////////////////////
 
     CUTLASS_DEVICE static float compute_qk_dot(
@@ -508,6 +509,7 @@ struct CollectiveMainloopFwdSm100FP4Mma {
 
         float score = 0.0f;
 
+        #pragma unroll
         for (int sf_block = 0; sf_block < NumSFPerHead; ++sf_block) {
             int d_start = sf_block * SFVectorSize;
 
@@ -536,7 +538,7 @@ struct CollectiveMainloopFwdSm100FP4Mma {
 
     ///////////////////////////////////////////////////////////////////////////
     // Accumulate weighted V from SMEM (scalar fallback)
-    // TODO: Replace with tensor core MMA
+    // TODO: Replace with SM100_MMA_MXF4_SS tensor core MMA
     ///////////////////////////////////////////////////////////////////////////
 
     CUTLASS_DEVICE static void accumulate_pv(
