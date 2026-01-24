@@ -7,23 +7,19 @@
  * This uses CUTLASS's SM100 block-scaled UMMA support with tcgen05.mma
  * instructions for FP4 quantized attention on datacenter Blackwell.
  *
- * IMPORTANT: SM100 FP4 requires K dimension = 256 for MMA.
- * Valid 1SM tile shapes: 128x128x256, 128x192x256, 128x256x256
- * Valid 2SM tile shapes: 256x128x256, 256x192x256, 256x256x256
+ * Key Design Decisions:
+ * ---------------------
+ * 1. SM100 FP4 block-scaled MMA requires K=256 for optimal tensor core usage
+ * 2. For HeadDim=128, we pad to 256 or use K-loop with K=128 tiles
+ * 3. Block-scaled format: E2M1 data with E4M3 scale factors, 16 elements per SF
  *
- * For Flash Attention with HeadDim=128 (Wan2.2):
- * - QK matmul: Q(128×128) @ K^T(128×128) - K dimension is HeadDim
- *   PROBLEM: HeadDim=128 but FP4 MMA requires K=256
- *   SOLUTION: Pad HeadDim to 256, or use 2 K-blocks of 128 each (not supported)
+ * For Flash Attention:
+ * - QK GEMM: Q(BlockM×HeadDim) @ K^T(HeadDim×BlockN) → S(BlockM×BlockN)
+ * - PV GEMM: P(BlockM×BlockN) @ V(BlockN×HeadDim) → O(BlockM×HeadDim)
  *
- * For Flash Attention with HeadDim=256:
- * - QK matmul: Q(BlockM×256) @ K^T(256×BlockN) - K=256 ✓
- * - PV matmul: P(BlockM×BlockN) @ V(BlockN×256) - K must be 256
- *   CONSTRAINT: BlockN must be 256 for FP4 PV matmul
- *
- * Tile configuration:
- * - QK: (128, 256, 256) - 1SM tile, outputs S(128×256)
- * - PV: (128, 256, 256) - 1SM tile, outputs O(128×256)
+ * With HeadDim=128, BlockN=128:
+ * - We use TileShape (128, 128, 128) and rely on K-loop for larger K
+ * - SM100 block-scaled handles the scale factor application automatically
  */
 
 #pragma once
@@ -31,39 +27,94 @@
 #include "cute/algorithm/copy.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/tensor.hpp"
+#include "cute/arch/tmem_allocator_sm100.hpp"
+#include "cute/arch/mma_sm100_umma.hpp"
+#include "cute/atom/mma_traits_sm100.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/layout/layout.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/pipeline/pipeline.hpp"
+#include "cutlass/pipeline/sm100_pipeline.hpp"
 
 // SM100 block-scaled support
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 
-// CUTE SM100 MMA support
-#include "cute/arch/mma_sm100_umma.hpp"
-#include "cute/atom/mma_traits_sm100.hpp"
-#include "cute/arch/tmem_allocator_sm100.hpp"
-
 namespace flash {
 
 using namespace cute;
 
 ///////////////////////////////////////////////////////////////////////////////
+// SM100 Warp Roles for FP4 FMHA
+///////////////////////////////////////////////////////////////////////////////
+
+struct Sm100FP4WarpSpecializedSchedule {
+    enum class WarpRole {
+        Softmax0,      // warps 0-3: softmax processing for S0
+        Softmax1,      // warps 4-7: softmax processing for S1
+        Correction,    // warps 8-11: online softmax correction
+        MMA,           // warp 12: MMA warp
+        Load,          // warp 13: TMA load warp
+        Epilogue,      // warp 14: epilogue warp
+        Empty          // warp 15: unused
+    };
+
+    static constexpr WarpRole warp_idx_to_role(int warp_idx) {
+        int wg_idx = warp_idx / 4;
+        if (wg_idx == 0) return WarpRole::Softmax0;
+        if (wg_idx == 1) return WarpRole::Softmax1;
+        if (wg_idx == 2) return WarpRole::Correction;
+        if (warp_idx == 12) return WarpRole::MMA;
+        if (warp_idx == 13) return WarpRole::Load;
+        if (warp_idx == 14) return WarpRole::Epilogue;
+        return WarpRole::Empty;
+    }
+
+    static constexpr int kNumWarps = 16;
+    static constexpr int kNumRegsSoftmax = 192;
+    static constexpr int kNumRegsCorrection = 96;
+    static constexpr int kNumRegsOther = 32;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// TMEM Allocation for SM100 FP4 FMHA
+///////////////////////////////////////////////////////////////////////////////
+
+enum class Sm100FP4TmemAlloc : uint32_t {
+    kSizeS = 128,  // S matrix (QK scores)
+    kSizeO = 128,  // O matrix (output accumulator)
+    kSizeP = 32,   // P matrix (quantized softmax)
+    S0 = 0,
+    S1 = S0 + kSizeS,
+    V0 = S0,       // Reuse S0 for stats storage
+    V1 = S1,       // Reuse S1 for stats storage
+    P0 = S0 + kSizeP,
+    P1 = S1 + kSizeP,
+    O0 = S1 + kSizeS,
+    O1 = O0 + kSizeO,
+    kEnd = O1 + kSizeO
+};
+
+// Stats indices for online softmax
+enum {
+    kIdxOldRowMax = 0,
+    kIdxNewRowMax = 1,
+    kIdxFinalRowSum = 0,
+    kIdxFinalRowMax = 1
+};
+
+///////////////////////////////////////////////////////////////////////////////
 // SM100 FP4 Block-Scaled Flash Forward Kernel Traits
-//
-// Uses CUTLASS's SM100 block-scaled UMMA for FP4 attention with tcgen05.mma
-// Both QK and PV matmuls use tile shape (128, 256, 256) to satisfy K=256
 ///////////////////////////////////////////////////////////////////////////////
 
 template <
-    int kHeadDim_,    // Must be 256 for FP4 (or data padded to 256)
-    int kBlockM_,     // 128 for 1SM
-    int kBlockN_,     // Must be 256 for FP4 PV matmul K dimension
-    int kStages_,
-    int kClusterM_,
-    bool BlockMean_,
+    int kHeadDim_,    // Head dimension (128 or 256, padded if needed)
+    int kBlockM_,     // Block size for Q rows (128 or 256)
+    int kBlockN_,     // Block size for K/V sequence (128)
+    int kStages_,     // Pipeline stages (2-4)
+    int kClusterM_,   // Cluster shape in M (1 or 2)
+    bool BlockMean_,  // Whether to use block mean subtraction
     typename ElementOut_ = cutlass::bfloat16_t
 >
 struct Flash_fwd_kernel_traits_sm100_fp4 {
@@ -73,206 +124,247 @@ struct Flash_fwd_kernel_traits_sm100_fp4 {
     static constexpr int kBlockN = kBlockN_;
     static constexpr int kHeadDim = kHeadDim_;
     static constexpr bool BlockMean = BlockMean_;
+    static constexpr int kClusterM = kClusterM_;
 
-    // SM100 FP4 requirements - K must be 256 for both matmuls
-    static_assert(kHeadDim == 256, "SM100 FP4 requires HeadDim = 256 (pad if needed)");
-    static_assert(kBlockN == 256, "SM100 FP4 requires BlockN = 256 for PV matmul K dimension");
-    static_assert(kBlockM == 128, "SM100 FP4 1SM requires BlockM = 128");
+    // Validate dimensions
+    static_assert(kHeadDim >= 128 && kHeadDim % 64 == 0,
+                  "HeadDim must be >= 128 and multiple of 64");
+    static_assert(kBlockM >= 128 && kBlockM % 128 == 0,
+                  "BlockM must be >= 128 and multiple of 128");
+    static_assert(kBlockN >= 64 && kBlockN % 64 == 0,
+                  "BlockN must be >= 64 and multiple of 64");
 
     // Pipeline stages
     static constexpr int kStageCountQ = 2;
     static constexpr int kStageCountKV = kStages_;
 
-    // Element types for FP4 block-scaled attention
-    // NVF4 format: FP4 data (e2m1) with FP8 E4M3 scale factors, vector size 16
-    using ElementData = cutlass::float_e2m1_t;           // FP4 data type
-    using ElementSF = cutlass::float_e4m3_t;             // FP8 E4M3 scale factors (matches PyTorch float8_e4m3fn)
-    using Element = cutlass::nv_float4_t<ElementData>;   // NVF4 packed type with scales
-    using ElementAccum = float;
-    using ElementOut = ElementOut_;
+    //=========================================================================
+    // Element Types for FP4 Block-Scaled Attention
+    //=========================================================================
+
+    // FP4 format: E2M1 data with E4M3 scale factors
+    // CUTLASS nv_float4_t wraps FP4 data for block-scaled operations
+    using ElementData = cutlass::float_e2m1_t;       // FP4 data (E2M1)
+    using ElementSF = cutlass::float_e4m3_t;         // Scale factor (E4M3)
+    using Element = cutlass::nv_float4_t<ElementData>; // Packed type for MMA
+    using ElementAccum = float;                       // FP32 accumulator
+    using ElementOut = ElementOut_;                   // Output type (BF16)
     using index_t = int64_t;
 
-    // Scale factor configuration (NVF4 uses vector size 16)
+    // Scale factor configuration - 16 elements per scale factor block
     static constexpr int SFVectorSize = 16;
-    static constexpr int NumSFPerHeadDim = kHeadDim / SFVectorSize;  // 256/16 = 16 scale factors
-    static constexpr int NumSFPerBlockN = kBlockN / SFVectorSize;    // 256/16 = 16 scale factors
+    static constexpr int NumSFPerHeadDim = kHeadDim / SFVectorSize;
+    static constexpr int NumSFPerBlockN = kBlockN / SFVectorSize;
 
-    // Tile shapes for SM100 block-scaled GEMM
-    // CRITICAL: Must use valid SM100 FP4 tile shapes with K=256
-    //
-    // QK matmul: Q(BlockM x HeadDim) @ K^T(HeadDim x BlockN) -> S(BlockM x BlockN)
-    //   Tile: (128, 256, 256) - M=BlockM=128, N=BlockN=256, K=HeadDim=256
-    //
-    // PV matmul: P(BlockM x BlockN) @ V(BlockN x HeadDim) -> O(BlockM x HeadDim)
-    //   Tile: (128, 256, 256) - M=BlockM=128, N=HeadDim=256, K=BlockN=256
-    using TileShapeQK = Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;  // (128, 256, 256)
-    using TileShapePV = Shape<Int<kBlockM>, Int<kHeadDim>, Int<kBlockN>>;  // (128, 256, 256)
-    using ClusterShape_MNK = Shape<Int<kClusterM_>, _1, _1>;
+    //=========================================================================
+    // Tile Shapes
+    //=========================================================================
 
-    // Architecture tags
+    // For QK GEMM: Q(M×K) @ K^T(K×N) → S(M×N) where K=HeadDim
+    // For PV GEMM: P(M×K) @ V(K×N) → O(M×N) where K=BlockN, N=HeadDim
+    using TileShapeQK = Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
+    using TileShapePV = Shape<Int<kBlockM>, Int<kHeadDim>, Int<kBlockN>>;
+    using TileShape_MNK = TileShapeQK;  // Primary tile shape
+    using ClusterShape_MNK = Shape<Int<kClusterM>, _1, _1>;
+
+    // Thread shape for warp-specialized execution
+    using ThreadShape = Shape<_2, _1, _1>;  // 2 Q groups processed
+    using TileShapeQK_perWG = decltype(shape_div(TileShapeQK{}, ThreadShape{}));
+    using TileShapePV_perWG = decltype(select<0,2,1>(TileShapeQK_perWG{}));
+
+    //=========================================================================
+    // Architecture and Layout Configuration
+    //=========================================================================
+
     using ArchTag = cutlass::arch::Sm100;
     using OpClass = cutlass::arch::OpClassBlockScaledTensorOp;
 
-    // Layout tags for CUTLASS - TN layout (A row-major, B col-major)
-    using LayoutATag = cutlass::layout::RowMajor;
-    using LayoutBTag = cutlass::layout::ColumnMajor;
+    // GMEM layouts - row-major for Q/K, column-major for V
+    using LayoutATag = cutlass::layout::RowMajor;     // Q: row-major
+    using LayoutBTag = cutlass::layout::ColumnMajor;  // K^T: col-major (K is row-major, transposed)
+    using LayoutVTag = cutlass::layout::RowMajor;     // V: row-major
 
-    // Alignment for FP4 (32 elements = 16 bytes for packed FP4)
+    // Alignment for FP4 (32 elements = 16 bytes for packed FP4 pair)
     static constexpr int AlignmentA = 32;
     static constexpr int AlignmentB = 32;
+    static constexpr int AlignmentOut = 128 / cutlass::sizeof_bits<ElementOut>::value;
 
     // Strides for GMEM tensors
+    // Layout: (seq, dim, batch*head) with dim stride = 1
     using StrideQ = Stride<int64_t, _1, int64_t>;
     using StrideK = Stride<int64_t, _1, int64_t>;
-    using StrideV = Stride<_1, int64_t, int64_t>;  // V transposed
+    using StrideV = Stride<_1, int64_t, int64_t>;  // V is (dim, seq, batch*head)
     using StrideO = Stride<int64_t, _1, int64_t>;
 
-    ///////////////////////////////////////////////////////////////////////////
-    // Use CollectiveBuilder for SM100 block-scaled configuration
-    ///////////////////////////////////////////////////////////////////////////
+    //=========================================================================
+    // CUTLASS CollectiveBuilder for QK GEMM
+    //=========================================================================
 
-    // QK matmul Collective - uses tile (128, 256, 256)
+    // The builder automatically configures:
+    // - TMA descriptors for data and scale factors
+    // - SMEM layouts with proper swizzling
+    // - Block-scaled MMA atoms
     using CollectiveMmaQK = typename cutlass::gemm::collective::CollectiveBuilder<
         ArchTag, OpClass,
-        Element, LayoutATag, AlignmentA,  // A = Q (FP4 with scales)
-        Element, LayoutBTag, AlignmentB,  // B = K^T (FP4 with scales)
+        Element, LayoutATag, AlignmentA,    // A = Q (FP4)
+        Element, LayoutBTag, AlignmentB,    // B = K^T (FP4)
         ElementAccum,
         TileShapeQK, ClusterShape_MNK,
         cutlass::gemm::collective::StageCountAuto,
         cutlass::gemm::collective::KernelScheduleAuto
     >::CollectiveOp;
 
-    // PV matmul Collective - uses tile (128, 256, 256)
+    //=========================================================================
+    // CUTLASS CollectiveBuilder for PV GEMM
+    //=========================================================================
+
+    // Note: P (softmax output) needs to be quantized to FP4 for MMA
+    // V is pre-quantized to FP4
     using CollectiveMmaPV = typename cutlass::gemm::collective::CollectiveBuilder<
         ArchTag, OpClass,
-        Element, LayoutATag, AlignmentA,  // A = P (quantized softmax)
-        Element, LayoutBTag, AlignmentB,  // B = V (FP4 with scales)
+        Element, LayoutATag, AlignmentA,    // A = P (quantized softmax)
+        Element, LayoutVTag, AlignmentB,    // B = V (FP4)
         ElementAccum,
         TileShapePV, ClusterShape_MNK,
         cutlass::gemm::collective::StageCountAuto,
         cutlass::gemm::collective::KernelScheduleAuto
     >::CollectiveOp;
 
-    // Extract types from CollectiveBuilder
+    //=========================================================================
+    // Types from CollectiveBuilder
+    //=========================================================================
+
     using TiledMmaQK = typename CollectiveMmaQK::TiledMma;
     using TiledMmaPV = typename CollectiveMmaPV::TiledMma;
+    using AtomThrShapeMNK = typename CollectiveMmaQK::AtomThrShapeMNK;
 
-    // SMEM layouts from CollectiveBuilder (includes data + scale factor layouts)
+    // SMEM layouts for data and scale factors
     using SmemLayoutQ = typename CollectiveMmaQK::SmemLayoutA;
     using SmemLayoutK = typename CollectiveMmaQK::SmemLayoutB;
     using SmemLayoutV = typename CollectiveMmaPV::SmemLayoutB;
-    using SmemLayoutSFA = typename CollectiveMmaQK::SmemLayoutSFA;
-    using SmemLayoutSFB_QK = typename CollectiveMmaQK::SmemLayoutSFB;
-    using SmemLayoutSFB_PV = typename CollectiveMmaPV::SmemLayoutSFB;
+    using SmemLayoutSFQ = typename CollectiveMmaQK::SmemLayoutSFA;
+    using SmemLayoutSFK = typename CollectiveMmaQK::SmemLayoutSFB;
+    using SmemLayoutSFV = typename CollectiveMmaPV::SmemLayoutSFB;
 
-    // Scale factor layout types
+    // GMEM layouts for scale factors
     using LayoutSFA = typename CollectiveMmaQK::LayoutSFA;
     using LayoutSFB = typename CollectiveMmaQK::LayoutSFB;
 
-    // TMA descriptors from CollectiveBuilder
-    using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
-    using TMA_K = typename CollectiveMmaQK::Params::TMA_B;
-    using TMA_V = typename CollectiveMmaPV::Params::TMA_B;
-    using TMA_SFA = typename CollectiveMmaQK::Params::TMA_SFA;
-    using TMA_SFB = typename CollectiveMmaQK::Params::TMA_SFB;
-    using TMA_SFV = typename CollectiveMmaPV::Params::TMA_SFB;
+    //=========================================================================
+    // Warp Configuration
+    //=========================================================================
 
-    ///////////////////////////////////////////////////////////////////////////
-    // Warp Configuration - simplified for initial implementation
-    ///////////////////////////////////////////////////////////////////////////
-
-    // For simplified direct GMEM version: 128 threads = 128 rows (one thread per row)
-    // Each thread needs HeadDim floats = 256 * 4 = 1024 bytes = 256 registers
-    // With 128 threads per block, this should fit in SM100's register file
-    static constexpr int kNWarps = 4;  // 128 threads
+    using Schedule = Sm100FP4WarpSpecializedSchedule;
+    static constexpr int kNWarps = Schedule::kNumWarps;
     static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
-    static constexpr int kClusterM = kClusterM_;
 
-    ///////////////////////////////////////////////////////////////////////////
-    // Pipeline Types - use CUTLASS's SM100 pipelines
-    ///////////////////////////////////////////////////////////////////////////
+    //=========================================================================
+    // Pipeline Types
+    //=========================================================================
 
-    using AtomThrShape = typename CollectiveMmaQK::AtomThrShapeMNK;
-
-    // TMA-UMMA async pipelines
-    using PipelineQ = cutlass::PipelineTmaUmmaAsync<kStageCountQ, ClusterShape_MNK, AtomThrShape>;
-    using PipelineKV = cutlass::PipelineTmaUmmaAsync<kStageCountKV, ClusterShape_MNK, AtomThrShape>;
+    // TMA-UMMA async pipelines for data loading
+    using PipelineQ = cutlass::PipelineTmaUmmaAsync<kStageCountQ, ClusterShape_MNK, AtomThrShapeMNK>;
+    using PipelineKV = cutlass::PipelineTmaUmmaAsync<kStageCountKV, ClusterShape_MNK, AtomThrShapeMNK>;
 
     // Inter-warp communication pipelines
-    using PipelineS = cutlass::PipelineUmmaAsync<1, AtomThrShape>;
-    using PipelineC = cutlass::PipelineAsync<1>;
-    using PipelineO = cutlass::PipelineUmmaAsync<2, AtomThrShape>;
-    using PipelineE = cutlass::PipelineAsync<2>;
+    using PipelineS = cutlass::PipelineUmmaAsync<1, AtomThrShapeMNK>;  // MMA → Softmax
+    using PipelineC = cutlass::PipelineAsync<1>;                        // Softmax → Correction
+    using PipelineO = cutlass::PipelineUmmaAsync<2, AtomThrShapeMNK>;  // MMA → Correction
+    using PipelineE = cutlass::PipelineAsync<2>;                        // Correction → Epilogue
     using OrderBarrierSoftmax = cutlass::OrderedSequenceBarrier<1, 2>;
 
-    ///////////////////////////////////////////////////////////////////////////
-    // TMEM Allocation for SM100 FP4
-    ///////////////////////////////////////////////////////////////////////////
+    //=========================================================================
+    // TMEM Allocation
+    //=========================================================================
 
-    enum class TmemAlloc : uint32_t {
-        kSizeS = 128,  // S matrix (softmax scores)
-        kSizeO = 128,  // O matrix (output accumulator)
-        kSizeP = 32,   // P matrix (quantized softmax for PV)
-        S0 = 0,
-        S1 = S0 + kSizeS,
-        P0 = S0 + kSizeP,
-        P1 = S1 + kSizeP,
-        O0 = S1 + kSizeS,
-        O1 = O0 + kSizeO,
-        kEnd = O1 + kSizeO
-    };
-
+    using TmemAlloc = Sm100FP4TmemAlloc;
     using TmemAllocator = cute::TMEM::Allocator1Sm;
 
-    ///////////////////////////////////////////////////////////////////////////
+    //=========================================================================
     // Output Layout
-    ///////////////////////////////////////////////////////////////////////////
+    //=========================================================================
+
+    using EpilogueTileShape = Shape<
+        decltype(get<0>(TileShapeQK_perWG{})),  // M
+        decltype(get<2>(TileShapeQK_perWG{})),  // HeadDim
+        _1
+    >;
 
     using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
         cute::UMMA::Major::K, ElementOut,
-        Int<kBlockM>, Int<kHeadDim>
+        decltype(get<0>(EpilogueTileShape{})),
+        decltype(get<1>(EpilogueTileShape{}))
     >());
+
     using SmemLayoutO = decltype(tile_to_shape(
         SmemLayoutAtomO{},
-        Shape<Int<kBlockM>, Int<kHeadDim>, _2>{},
+        replace<2>(EpilogueTileShape{}, _2{}),  // 2 stages for double buffering
         Step<_2, _1, _3>{}
     ));
 
-    ///////////////////////////////////////////////////////////////////////////
-    // Shared Storage - Simplified for direct GMEM implementation
-    // Full SMEM/pipeline storage will be needed for TMA-based version
-    ///////////////////////////////////////////////////////////////////////////
+    //=========================================================================
+    // Shared Storage
+    //=========================================================================
 
     struct SharedStorage : cute::aligned_struct<128, _0> {
-        // Minimal shared storage for synchronization
-        // The simplified implementation uses direct GMEM access
-        alignas(128) uint32_t sync_flag;
+        // Q data + scale factors
+        cute::array_aligned<typename Element::DataType, cute::cosize_v<SmemLayoutQ>> smem_q;
+        cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFQ>> smem_sfq;
+
+        // K/V data + scale factors (union since they're used at different times)
+        union {
+            struct {
+                cute::array_aligned<typename Element::DataType, cute::cosize_v<SmemLayoutK>> smem_k;
+                cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFK>> smem_sfk;
+            };
+            struct {
+                cute::array_aligned<typename Element::DataType, cute::cosize_v<SmemLayoutV>> smem_v;
+                cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFV>> smem_sfv;
+            };
+        };
+
+        // Output buffer
+        cute::array_aligned<ElementOut, cute::cosize_v<SmemLayoutO>> smem_o;
+
+        // Pipeline storage
+        struct {
+            alignas(16) typename PipelineQ::SharedStorage pipeline_q;
+            alignas(16) typename PipelineKV::SharedStorage pipeline_kv;
+            alignas(16) typename PipelineS::SharedStorage pipeline_s0;
+            alignas(16) typename PipelineS::SharedStorage pipeline_s1;
+            alignas(16) typename PipelineC::SharedStorage pipeline_c0;
+            alignas(16) typename PipelineC::SharedStorage pipeline_c1;
+            alignas(16) typename PipelineO::SharedStorage pipeline_o;
+            alignas(16) typename PipelineE::SharedStorage pipeline_epi;
+            alignas(16) typename OrderBarrierSoftmax::SharedStorage order_s01;
+        } pipelines;
+
+        // TMEM base pointer
+        uint32_t tmem_base_ptr;
     };
 
-    ///////////////////////////////////////////////////////////////////////////
-    // TMA Transaction Bytes
-    ///////////////////////////////////////////////////////////////////////////
+    //=========================================================================
+    // TMA Transaction Sizes
+    //=========================================================================
 
     static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(
-        cutlass::bits_to_bytes(cosize(SmemLayoutQ{}) * cute::sizeof_bits_v<ElementData>) +
-        cosize(SmemLayoutSFA{}) * sizeof(ElementSF));
+        size(AtomThrShapeMNK{}) * (
+            cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutQ{})) * cute::sizeof_bits_v<ElementData>) +
+            cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutSFQ{})) * cute::sizeof_bits_v<ElementSF>)
+        ));
 
-    static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(
-        cutlass::bits_to_bytes(cosize(SmemLayoutK{}) * cute::sizeof_bits_v<ElementData>) +
-        cosize(SmemLayoutSFB_QK{}) * sizeof(ElementSF));
+    static constexpr uint32_t TmaTransactionBytesKV = static_cast<uint32_t>(
+        cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutK{})) * cute::sizeof_bits_v<ElementData>) +
+        cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutSFK{})) * cute::sizeof_bits_v<ElementSF>));
 
-    static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(
-        cutlass::bits_to_bytes(cosize(SmemLayoutV{}) * cute::sizeof_bits_v<ElementData>) +
-        cosize(SmemLayoutSFB_PV{}) * sizeof(ElementSF));
+    //=========================================================================
+    // Legacy Compatibility Aliases
+    //=========================================================================
 
-    ///////////////////////////////////////////////////////////////////////////
-    // Legacy compatibility
-    ///////////////////////////////////////////////////////////////////////////
-
-    using TileShape_MNK = TileShapeQK;  // Primary tile shape
     using MainloopPipeline = PipelineKV;
     using PipelineState = typename PipelineKV::PipelineState;
     static constexpr int kStages = kStageCountKV;
+    static constexpr int EpiStages = 2;
 };
 
 } // namespace flash
