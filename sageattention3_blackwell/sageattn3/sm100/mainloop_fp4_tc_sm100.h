@@ -734,13 +734,15 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
             load_k_tile_cooperative(params, storage, n_tile, head_idx, batch_idx, seqlen_k);
             __syncthreads();
 
+            // Per-thread storage for scores (computed while K is in SMEM)
+            float tile_scores[256];  // Fixed size for BlockN=256
+            float tile_max = -INFINITY;
+            float new_max = -INFINITY;
+
             if (thread_row < rows_this_tile) {
                 int global_row = row_start + thread_row;
 
-                // Compute tile scores and find tile max
-                float tile_max = -INFINITY;
-                float tile_scores[256];  // Fixed size for BlockN=256
-
+                // Compute ALL tile scores while K is still in SMEM
                 for (int j = 0; j < tile_cols; ++j) {
                     int global_col = tile_col_start + j;
 
@@ -765,7 +767,7 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
 
                 // Online softmax update
                 float old_max = storage.smem_row_max[thread_row];
-                float new_max = fmaxf(old_max, tile_max);
+                new_max = fmaxf(old_max, tile_max);
 
                 // Rescale existing accumulator
                 if (old_max != -INFINITY && new_max != old_max) {
@@ -782,34 +784,15 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
 
             __syncthreads();
 
-            // Load V tile (reuses K SMEM space)
+            // Load V tile (reuses K SMEM space - K is no longer needed!)
             load_v_tile_cooperative(params, storage, n_tile, head_idx, batch_idx, seqlen_k);
             __syncthreads();
 
-            // Continue softmax and PV accumulation
+            // Use pre-computed scores (stored in registers) for PV accumulation
             if (thread_row < rows_this_tile) {
-                float new_max = storage.smem_row_max[thread_row];
-
-                // Recompute scores and accumulate PV
+                // Use scores from registers - DO NOT recompute (K is gone!)
                 for (int j = 0; j < tile_cols; ++j) {
-                    int global_col = tile_col_start + j;
-                    int global_row = row_start + thread_row;
-
-                    // Recompute score (or store in registers above if memory permits)
-                    float score = compute_qk_dot_optimized(storage, thread_row, j);
-                    score *= params.scale_softmax;
-
-                    if (delta_s_base != nullptr) {
-                        score += delta_s_base[global_col * params.stride_ds_k] * params.scale_softmax;
-                    }
-
-                    if constexpr (Is_causal) {
-                        if (global_col > global_row) {
-                            score = -INFINITY;
-                        }
-                    }
-
-                    float weight = expf(score - new_max);
+                    float weight = expf(tile_scores[j] - new_max);
                     storage.smem_row_sum[thread_row] += weight;
 
                     // Accumulate PV
