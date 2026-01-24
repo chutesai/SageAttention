@@ -128,11 +128,17 @@ def test_fp4_correctness():
             print("  ERROR: FP4 output contains Inf")
             continue
 
-        # Compute correlation
-        fp4_flat = fp4_out_float.flatten()
-        ref_flat = ref_out_float.flatten()
+        # Compute correlation on CPU to avoid cuBLAS issues
+        fp4_flat = fp4_out_float.flatten().cpu()
+        ref_flat = ref_out_float.flatten().cpu()
 
-        correlation = torch.corrcoef(torch.stack([fp4_flat, ref_flat]))[0, 1].item()
+        # Manual correlation computation
+        fp4_mean = fp4_flat.mean()
+        ref_mean = ref_flat.mean()
+        fp4_centered = fp4_flat - fp4_mean
+        ref_centered = ref_flat - ref_mean
+        correlation = (fp4_centered * ref_centered).sum() / (fp4_centered.norm() * ref_centered.norm() + 1e-8)
+        correlation = correlation.item()
 
         # Compute relative error
         abs_diff = (fp4_out_float - ref_out_float).abs()
@@ -189,8 +195,15 @@ def test_causal_mask():
         print(f"ERROR: Kernel failed: {e}")
         return
 
-    # Compare
-    correlation = torch.corrcoef(torch.stack([fp4_out.float().flatten(), ref_out.float().flatten()]))[0, 1].item()
+    # Compare - compute on CPU
+    fp4_flat = fp4_out.float().flatten().cpu()
+    ref_flat = ref_out.float().flatten().cpu()
+    fp4_mean = fp4_flat.mean()
+    ref_mean = ref_flat.mean()
+    fp4_centered = fp4_flat - fp4_mean
+    ref_centered = ref_flat - ref_mean
+    correlation = (fp4_centered * ref_centered).sum() / (fp4_centered.norm() * ref_centered.norm() + 1e-8)
+    correlation = correlation.item()
     print(f"Causal correlation: {correlation:.6f}")
 
     if correlation > 0.99:
