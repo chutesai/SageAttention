@@ -137,6 +137,7 @@ using FmhaFP8Causal = FmhaKernelFP8<MaskCausal>;
 #include "mainloop_fp4_tc_sm100.h"  // High-performance tensor core implementation
 #include "mainloop_fp4_cute_mma.h"  // CuTe-based MMA implementation
 #include "mainloop_fp4_tcgen05.h"   // TCGen05 optimized implementation
+#include "mainloop_fp4_sm100_tc.h"  // SM100 tensor core implementation
 
 using ElementFP4 = cutlass::float_e2m1_t;
 using ElementFP4SF = cutlass::float_e4m3_t;  // Signed E4M3 to match PyTorch float8_e4m3fn
@@ -211,7 +212,7 @@ struct FmhaKernelFP4Mma {
 // FP4 tcgen05 variant - high-performance optimized SMEM-based implementation
 template <bool Is_causal>
 struct FmhaKernelFP4Tcgen05 {
-    using Ktraits = flash::Flash_fwd_kernel_traits_sm100_fp4_tcgen05<
+    using Ktraits = flash::Flash_fwd_kernel_traits_sm100_fp4_tcgen05_v2<
         256,   // kHeadDim (must be 256 for FP4)
         128,   // kBlockM (matches MMA M size)
         256,   // kBlockN (must be 256 for FP4 PV matmul)
@@ -236,6 +237,21 @@ struct FmhaKernelFP4CuteMma {
     using Kernel = flash::Sm100FlashFwdKernelFP4CuteMma<Ktraits, Is_causal, TileScheduler>;
 };
 
+// FP4 SM100 TC V2 - Optimized SM100 tensor core kernel with proper TMEM support
+template <bool Is_causal>
+struct FmhaKernelFP4SM100TC {
+    using Ktraits = flash::Flash_fwd_kernel_traits_sm100_fp4_tc_v2<
+        256,   // kHeadDim (must be 256 for FP4)
+        128,   // kBlockM (SM100 MMA M=128)
+        256,   // kBlockN
+        2,     // kStages
+        ElementFP4Out
+    >;
+
+    using TileScheduler = flash::SimpleTileSchedulerFP4;
+    using Kernel = flash::Sm100FlashFwdKernelFP4TC_V2<Ktraits, Is_causal, TileScheduler>;
+};
+
 using FmhaFP4NoMask = FmhaKernelFP4<false>;
 using FmhaFP4Causal = FmhaKernelFP4<true>;
 using FmhaFP4CuteMmaNoMask = FmhaKernelFP4CuteMma<false>;
@@ -248,6 +264,8 @@ using FmhaFP4MmaNoMask = FmhaKernelFP4Mma<false>;
 using FmhaFP4MmaCausal = FmhaKernelFP4Mma<true>;
 using FmhaFP4Tcgen05NoMask = FmhaKernelFP4Tcgen05<false>;
 using FmhaFP4Tcgen05Causal = FmhaKernelFP4Tcgen05<true>;
+using FmhaFP4SM100TCNoMask = FmhaKernelFP4SM100TC<false>;
+using FmhaFP4SM100TCCausal = FmhaKernelFP4SM100TC<true>;
 
 // Forward declaration of FP4 kernel wrapper
 template <typename Kernel>
@@ -817,10 +835,10 @@ torch::Tensor fmha_fwd_fp4_opt(
     }
 
     if (is_causal) {
-        return run_fmha_fp4_impl<FmhaFP4Tcgen05Causal>(
+        return run_fmha_fp4_impl<FmhaFP4SM100TCCausal>(
             q_data, q_sf, k_data, k_sf, v_data, v_sf, delta_s_ptr, scale);
     }
-    return run_fmha_fp4_impl<FmhaFP4Tcgen05NoMask>(
+    return run_fmha_fp4_impl<FmhaFP4SM100TCNoMask>(
         q_data, q_sf, k_data, k_sf, v_data, v_sf, delta_s_ptr, scale);
 }
 

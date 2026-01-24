@@ -60,7 +60,7 @@ template <
     int kBlockN_,
     typename ElementOut_ = cutlass::bfloat16_t
 >
-struct Flash_fwd_kernel_traits_sm100_fp4_tcgen05 {
+struct Flash_fwd_kernel_traits_sm100_fp4_tcgen05_v2 {
     static constexpr int kHeadDim = kHeadDim_;
     static constexpr int kBlockM = kBlockM_;
     static constexpr int kBlockN = kBlockN_;
