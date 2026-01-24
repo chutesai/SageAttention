@@ -15,11 +15,20 @@ assert torch.cuda.is_available(), "CUDA required"
 
 # Import SM100 kernels
 try:
-    import sageattn3.sm100.fmha_sm100 as fmha_sm100
+    # Try direct import first (for development)
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import fmha_sm100
     HAS_SM100 = True
-except ImportError as e:
-    print(f"Warning: Could not import SM100 kernels: {e}")
-    HAS_SM100 = False
+except ImportError:
+    try:
+        # Try package import
+        import sageattn3.sm100.fmha_sm100 as fmha_sm100
+        HAS_SM100 = True
+    except ImportError as e:
+        print(f"Warning: Could not import SM100 kernels: {e}")
+        HAS_SM100 = False
 
 def get_gpu_info():
     """Get GPU information."""
