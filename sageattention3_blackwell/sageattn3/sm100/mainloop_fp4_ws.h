@@ -266,33 +266,31 @@ struct CollectiveMainloopFwdSm100FP4 {
         auto K_data = reinterpret_cast<uint8_t const*>(params.ptr_K);
         auto V_data = reinterpret_cast<uint8_t const*>(params.ptr_V);
 
-        // Process K/V tiles
+        // Process K/V positions one at a time to minimize register usage
+        // This is a simplified scalar implementation - tensor cores will be much faster
+
         for (int n_tile = 0; n_tile < num_kv_tiles; ++n_tile) {
-            int col_start = n_tile * BlockN;
-            int cols_this_tile = min(BlockN, seqlen_k - col_start);
+            int tile_col_start = n_tile * BlockN;
+            int tile_cols = min(BlockN, seqlen_k - tile_col_start);
 
-            // =========================================================
-            // QK GEMM with block-scaled FP4
-            // =========================================================
+            // Process each K position individually to minimize register pressure
+            for (int j = 0; j < tile_cols; ++j) {
+                int global_col = tile_col_start + j;
 
-            float scores[BlockN];
-            CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < BlockN; ++j) {
-                scores[j] = 0.0f;
-            }
+                // =========================================================
+                // Compute single QK dot product with block-scaled FP4
+                // =========================================================
 
-            // Block-scaled dot product: Q[row,:] @ K[col_start:col_start+BlockN,:]^T
-            for (int sf_block = 0; sf_block < HeadDim / SFVecSize; ++sf_block) {
-                int d_start = sf_block * SFVecSize;
+                float score = 0.0f;
 
-                // Get Q scale factor for this block
-                int q_sf_offset = (batch_idx * params.stride_Q_batch +
-                                   head_idx * params.stride_Q_head +
-                                   global_row * params.stride_Q_seq) / SFVecSize + sf_block;
-                float q_scale = static_cast<float>(params.ptr_SFQ[q_sf_offset]);
+                for (int sf_block = 0; sf_block < HeadDim / SFVecSize; ++sf_block) {
+                    int d_start = sf_block * SFVecSize;
 
-                for (int j = 0; j < cols_this_tile; ++j) {
-                    int global_col = col_start + j;
+                    // Get Q scale factor for this block
+                    int q_sf_offset = (batch_idx * params.stride_Q_batch +
+                                       head_idx * params.stride_Q_head +
+                                       global_row * params.stride_Q_seq) / SFVecSize + sf_block;
+                    float q_scale = static_cast<float>(params.ptr_SFQ[q_sf_offset]);
 
                     // Get K scale factor for this block
                     int k_sf_offset = (batch_idx * params.stride_K_batch +
@@ -323,67 +321,47 @@ struct CollectiveMainloopFwdSm100FP4 {
                         block_sum += decode_fp4(q_byte, 0) * decode_fp4(k_byte, 0);
                         block_sum += decode_fp4(q_byte, 1) * decode_fp4(k_byte, 1);
                     }
-                    scores[j] += block_sum * combined_scale;
+                    score += block_sum * combined_scale;
                 }
-            }
 
-            // Apply softmax scaling
-            CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < cols_this_tile; ++j) {
-                scores[j] *= params.scale_softmax;
-            }
+                // Apply softmax scaling
+                score *= params.scale_softmax;
 
-            // Apply delta_s correction for smooth attention
-            if (delta_s_base != nullptr) {
-                for (int j = 0; j < cols_this_tile; ++j) {
-                    int global_col = col_start + j;
+                // Apply delta_s correction for smooth attention
+                if (delta_s_base != nullptr) {
                     float ds = delta_s_base[global_col * params.stride_ds_k];
-                    scores[j] += ds * params.scale_softmax;
+                    score += ds * params.scale_softmax;
                 }
-            }
 
-            // Apply causal mask if needed
-            if constexpr (Is_causal) {
-                CUTLASS_PRAGMA_UNROLL
-                for (int j = 0; j < BlockN; ++j) {
-                    int global_col = col_start + j;
+                // Apply causal mask if needed
+                if constexpr (Is_causal) {
                     if (global_col > global_row) {
-                        scores[j] = -INFINITY;
+                        score = -INFINITY;
                     }
                 }
-            }
 
-            // =========================================================
-            // Online Softmax Update
-            // =========================================================
+                // =========================================================
+                // Online Softmax Update
+                // =========================================================
 
-            // Find new row max
-            float new_max = row_max;
-            CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < cols_this_tile; ++j) {
-                new_max = fmaxf(new_max, scores[j]);
-            }
+                float new_max = fmaxf(row_max, score);
 
-            // Rescale previous sum and output
-            float scale_factor = (row_max == -INFINITY || row_max == new_max) ?
-                                 1.0f : expf(row_max - new_max);
-            row_sum *= scale_factor;
+                // Rescale previous sum and output if max changed
+                if (row_max != -INFINITY && new_max != row_max) {
+                    float scale_factor = expf(row_max - new_max);
+                    row_sum *= scale_factor;
+                    for (int d = 0; d < HeadDim; ++d) {
+                        thread_output[d] *= scale_factor;
+                    }
+                }
 
-            CUTLASS_PRAGMA_UNROLL
-            for (int d = 0; d < HeadDim; ++d) {
-                thread_output[d] *= scale_factor;
-            }
-
-            // Compute softmax weights and accumulate PV
-            CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < cols_this_tile; ++j) {
-                float weight = expf(scores[j] - new_max);
+                // Compute softmax weight and accumulate PV
+                float weight = expf(score - new_max);
                 row_sum += weight;
 
                 // =========================================================
-                // PV GEMM with block-scaled FP4
+                // Accumulate weighted V with block-scaled FP4
                 // =========================================================
-                int global_col = col_start + j;
 
                 for (int sf_block = 0; sf_block < HeadDim / SFVecSize; ++sf_block) {
                     int d_start = sf_block * SFVecSize;
@@ -407,9 +385,9 @@ struct CollectiveMainloopFwdSm100FP4 {
                         thread_output[dim_idx + 1] += weight * decode_fp4(v_byte, 1) * v_scale;
                     }
                 }
-            }
 
-            row_max = new_max;
+                row_max = new_max;
+            }
         }
 
         __syncthreads();

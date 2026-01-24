@@ -64,8 +64,10 @@ struct Flash_fwd_kernel_traits_sm100_fp4 {
     static constexpr int kClusterM = kClusterM_;
     static constexpr int kStages = kStages_;
     static constexpr int EpiStages = 2;
-    static constexpr int kNWarps = 16;
-    static constexpr int kNThreads = kNWarps * 32;
+    // For simplified scalar implementation: 1 thread per row
+    // For full tensor core implementation: 16 warps
+    static constexpr int kNWarps = kBlockM / 32;  // Each warp handles 32 rows
+    static constexpr int kNThreads = kBlockM;      // 1 thread per row for scalar impl
 
     //=========================================================================
     // Element Types for FP4 Block-Scaled Attention
@@ -151,146 +153,36 @@ struct Flash_fwd_kernel_traits_sm100_fp4 {
     static constexpr int MMA_NSF = 64 / SFVectorSize;  // MMA K=64, SF covers 16 elements
 
     //=========================================================================
-    // TMA Copy Atoms
+    // NOTE: Full tensor core implementation will need:
+    // - TMA Copy Atoms (SM90_TMA_LOAD)
+    // - SMEM Layouts for Q/K/V/O
+    // - Scale Factor SMEM Layouts
+    // - Copy Atoms for SMEM access
+    //
+    // These are commented out for the simplified scalar implementation
+    // to avoid issues with sm100_smem_selector and FP4 types.
     //=========================================================================
-
-    using GmemTiledCopy = SM90_TMA_LOAD;
-    using GmemTiledCopySF = SM90_TMA_LOAD;
-
-    //=========================================================================
-    // SMEM Layouts - following SM120 pattern
-    //=========================================================================
-
-    // Use CUTLASS SM100 SMEM selector for FP4 data
-    using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
-        UMMA::Major::K, Element, Int<kBlockM>, Int<kHeadDim>>());
-    using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
-        UMMA::Major::K, Element, Int<kBlockN>, Int<kHeadDim>>());
-    using SmemLayoutAtomV = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
-        UMMA::Major::K, Element, Int<kBlockN>, Int<kHeadDim>>());
-    using SmemLayoutAtomVt = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
-        UMMA::Major::K, Element, Int<kHeadDim>, Int<kBlockN>>());
-
-    using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQ{}, select<0, 2>(TileShape_MNK{})));
-    using SmemLayoutK = decltype(tile_to_shape(SmemLayoutAtomK{},
-        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
-    using SmemLayoutV = decltype(tile_to_shape(SmemLayoutAtomV{},
-        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
-    using SmemLayoutVt = decltype(tile_to_shape(SmemLayoutAtomVt{},
-        make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{})));
-
-    // Delta-S layout (for smooth attention correction)
-    using SmemLayoutAtomDS = Layout<Shape<Int<kBlockM>, Int<kBlockN>>, Stride<_0, _1>>;
-    using SmemLayoutDS = decltype(tile_to_shape(SmemLayoutAtomDS{},
-        make_shape(shape<0>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{})));
-
-    //=========================================================================
-    // Scale Factor SMEM Layouts
-    //=========================================================================
-
-    // Scale factors are stored separately from data
-    // Each SF covers 16 elements, so we have head_dim/16 SFs per row
-    using SmemLayoutAtomSFQ = Layout<
-        Shape<Int<kBlockM>, Int<NumSFPerHeadDim>>,
-        Stride<Int<NumSFPerHeadDim>, _1>
-    >;
-    using SmemLayoutAtomSFK = Layout<
-        Shape<Int<kBlockN>, Int<NumSFPerHeadDim>>,
-        Stride<Int<NumSFPerHeadDim>, _1>
-    >;
-    using SmemLayoutAtomSFV = SmemLayoutAtomSFK;
-    using SmemLayoutAtomSFVt = Layout<
-        Shape<Int<NumSFPerHeadDim>, Int<kBlockN>>,
-        Stride<_1, Int<NumSFPerHeadDim>>
-    >;
-
-    using SmemLayoutSFQ = decltype(make_layout(
-        shape(SmemLayoutAtomSFQ{}),
-        stride(SmemLayoutAtomSFQ{})
-    ));
-    using SmemLayoutSFK = decltype(make_layout(
-        append(shape(SmemLayoutAtomSFK{}), Int<kStages>{}),
-        append(stride(SmemLayoutAtomSFK{}), Int<kBlockN * NumSFPerHeadDim>{})
-    ));
-    using SmemLayoutSFV = SmemLayoutSFK;
-    using SmemLayoutSFVt = decltype(make_layout(
-        append(shape(SmemLayoutAtomSFVt{}), Int<kStages>{}),
-        append(stride(SmemLayoutAtomSFVt{}), Int<NumSFPerHeadDim * kBlockN>{})
-    ));
-
-    //=========================================================================
-    // Output SMEM Layout
-    //=========================================================================
-
-    using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
-        UMMA::Major::K, ElementOut, Int<kBlockM>, Int<kHeadDim>>());
-    using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_MNK{}), Step<_1, _2>{}));
-
-    //=========================================================================
-    // Copy Atoms
-    //=========================================================================
-
-    using SmemCopyAtomQ = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
-    using SmemCopyAtomKV = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
-    using SmemCopyAtomSF = Copy_Atom<UniversalCopy<ElementSF>, ElementSF>;
-    using SmemCopyAtomDS = Copy_Atom<UniversalCopy<float>, float>;
 
     //=========================================================================
     // Shared Storage
     //=========================================================================
 
-    struct SharedStorage : cute::aligned_struct<128, _0> {
-        // Q data and scale factors
-        cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
-        cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFQ>> smem_sfq;
-
-        // K data and scale factors (pipelined)
-        cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
-        cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFK>> smem_sfk;
-
-        // V data (transposed) and scale factors (pipelined)
-        cute::array_aligned<Element, cute::cosize_v<SmemLayoutVt>> smem_v;
-        cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFVt>> smem_sfvt;
-
-        // Delta-S for smooth attention (optional)
-        cute::array_aligned<float, cute::cosize_v<SmemLayoutDS>> smem_ds;
-
-        // Output buffer
-        cute::array_aligned<ElementOut, cute::cosize_v<SmemLayoutO>> smem_o;
-
-        // Pipeline storage
-        alignas(16) typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_kv;
-        alignas(16) typename cutlass::PipelineTmaAsync<1>::SharedStorage pipeline_q;
+    // Simplified shared storage for scalar fallback implementation
+    // Full tensor core implementation will need proper SMEM buffers
+    struct SharedStorage {
+        // Minimal storage - scalar implementation reads from global memory
+        // Just need some scratch space for synchronization
+        alignas(128) char scratch[256];
     };
 
     //=========================================================================
-    // Pipeline Types
+    // NOTE: Pipeline types and TMA transaction sizes are commented out
+    // for the simplified scalar implementation.
+    // Full tensor core implementation will need these.
     //=========================================================================
 
-    using MainloopPipeline = cutlass::PipelineTmaAsync<kStages>;
-    using PipelineState = typename cutlass::PipelineState<kStages>;
-    using MainloopPipelineQ = cutlass::PipelineTmaAsync<1>;
-    using PipelineParamsQ = typename MainloopPipelineQ::Params;
-    using PipelineStateQ = typename cutlass::PipelineState<1>;
-
     //=========================================================================
-    // TMA Transaction Sizes
-    //=========================================================================
-
-    static constexpr uint32_t TmaTransactionBytesQ =
-        cutlass::bits_to_bytes(cosize(SmemLayoutQ{}) * cute::sizeof_bits_v<Element>) +
-        cutlass::bits_to_bytes(cosize(SmemLayoutSFQ{}) * cute::sizeof_bits_v<ElementSF>);
-
-    static constexpr uint32_t TmaTransactionBytesK =
-        cutlass::bits_to_bytes(cosize(take<0,2>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>) +
-        cutlass::bits_to_bytes(cosize(take<0,2>(SmemLayoutSFK{})) * cute::sizeof_bits_v<ElementSF>);
-
-    static constexpr uint32_t TmaTransactionBytesVt =
-        cutlass::bits_to_bytes(cosize(take<0,2>(SmemLayoutVt{})) * cute::sizeof_bits_v<Element>) +
-        cutlass::bits_to_bytes(cosize(take<0,2>(SmemLayoutSFVt{})) * cute::sizeof_bits_v<ElementSF>);
-
-    //=========================================================================
-    // Strides
+    // Strides (used for global memory access)
     //=========================================================================
 
     using StrideQ = Stride<int64_t, _1, int64_t>;
