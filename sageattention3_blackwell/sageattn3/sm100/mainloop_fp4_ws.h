@@ -184,16 +184,14 @@ struct CollectiveMainloopFwdSm100FP4 {
     ///////////////////////////////////////////////////////////////////////////
 
     CUTLASS_DEVICE static float decode_fp4(uint8_t packed, int which) {
-        // Lookup table for FP4 E2M1 -> FP32 conversion
-        // Index 0-15 maps to the 16 possible FP4 values
-        // Defined inside function to avoid CUDA device code issues with static constexpr
-        constexpr float fp4_lut[16] = {
-            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-            -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-        };
+        // This matches the Python linear encoding:
+        // int_val = ((scaled / 6.0 * 7.5 + 7.5))
+        // So 0 -> -6.0, 7.5 -> 0.0, 15 -> +6.0
+        // Linear mapping: value = (nibble - 7.5) * (6.0 / 7.5) = (nibble - 7.5) * 0.8
+        //
         // Extract nibble (which = 0 for low nibble, 1 for high nibble)
         uint8_t nibble = which ? (packed >> 4) : (packed & 0x0F);
-        return fp4_lut[nibble];
+        return (static_cast<float>(nibble) - 7.5f) * 0.8f;
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -266,6 +264,20 @@ struct CollectiveMainloopFwdSm100FP4 {
         auto K_data = reinterpret_cast<uint8_t const*>(params.ptr_K);
         auto V_data = reinterpret_cast<uint8_t const*>(params.ptr_V);
 
+        // SF tensor strides (SF has head_dim/16 elements per row, not head_dim/2)
+        constexpr int NumSFPerRow = HeadDim / SFVecSize;  // = 16 for head_dim=256
+        const int sf_q_seq_stride = NumSFPerRow;
+        const int sf_q_head_stride = seqlen_q * NumSFPerRow;
+        const int sf_q_batch_stride = params.num_heads * sf_q_head_stride;
+
+        const int sf_k_seq_stride = NumSFPerRow;
+        const int sf_k_head_stride = seqlen_k * NumSFPerRow;
+        const int sf_k_batch_stride = params.num_heads * sf_k_head_stride;
+
+        const int sf_v_seq_stride = NumSFPerRow;
+        const int sf_v_head_stride = seqlen_k * NumSFPerRow;
+        const int sf_v_batch_stride = params.num_heads * sf_v_head_stride;
+
         // Process K/V positions one at a time to minimize register usage
         // This is a simplified scalar implementation - tensor cores will be much faster
 
@@ -287,15 +299,15 @@ struct CollectiveMainloopFwdSm100FP4 {
                     int d_start = sf_block * SFVecSize;
 
                     // Get Q scale factor for this block
-                    int q_sf_offset = (batch_idx * params.stride_Q_batch +
-                                       head_idx * params.stride_Q_head +
-                                       global_row * params.stride_Q_seq) / SFVecSize + sf_block;
+                    int q_sf_offset = batch_idx * sf_q_batch_stride +
+                                      head_idx * sf_q_head_stride +
+                                      global_row * sf_q_seq_stride + sf_block;
                     float q_scale = static_cast<float>(params.ptr_SFQ[q_sf_offset]);
 
                     // Get K scale factor for this block
-                    int k_sf_offset = (batch_idx * params.stride_K_batch +
-                                       head_idx * params.stride_K_head +
-                                       global_col * params.stride_K_seq) / SFVecSize + sf_block;
+                    int k_sf_offset = batch_idx * sf_k_batch_stride +
+                                      head_idx * sf_k_head_stride +
+                                      global_col * sf_k_seq_stride + sf_block;
                     float k_scale = static_cast<float>(params.ptr_SFK[k_sf_offset]);
 
                     // Combined scale factor
@@ -307,12 +319,13 @@ struct CollectiveMainloopFwdSm100FP4 {
                         int dim_idx = d_start + dd;
 
                         // Read packed FP4 values (2 per byte)
-                        int q_byte_offset = (batch_idx * params.stride_Q_batch +
+                        // Strides are already in bytes (packed FP4), so just add dim_idx/2
+                        int q_byte_offset = batch_idx * params.stride_Q_batch +
                                             head_idx * params.stride_Q_head +
-                                            global_row * params.stride_Q_seq) / 2 + dim_idx / 2;
-                        int k_byte_offset = (batch_idx * params.stride_K_batch +
+                                            global_row * params.stride_Q_seq + dim_idx / 2;
+                        int k_byte_offset = batch_idx * params.stride_K_batch +
                                             head_idx * params.stride_K_head +
-                                            global_col * params.stride_K_seq) / 2 + dim_idx / 2;
+                                            global_col * params.stride_K_seq + dim_idx / 2;
 
                         uint8_t q_byte = Q_data[q_byte_offset];
                         uint8_t k_byte = K_data[k_byte_offset];
@@ -367,18 +380,19 @@ struct CollectiveMainloopFwdSm100FP4 {
                     int d_start = sf_block * SFVecSize;
 
                     // Get V scale factor for this block
-                    int v_sf_offset = (batch_idx * params.stride_V_batch +
-                                       head_idx * params.stride_V_head +
-                                       global_col * params.stride_V_seq) / SFVecSize + sf_block;
+                    int v_sf_offset = batch_idx * sf_v_batch_stride +
+                                      head_idx * sf_v_head_stride +
+                                      global_col * sf_v_seq_stride + sf_block;
                     float v_scale = static_cast<float>(params.ptr_SFV[v_sf_offset]);
 
                     for (int dd = 0; dd < SFVecSize; dd += 2) {
                         int dim_idx = d_start + dd;
 
                         // Read packed FP4 V values
-                        int v_byte_offset = (batch_idx * params.stride_V_batch +
+                        // Data stride is in bytes (2 FP4 values per byte)
+                        int v_byte_offset = batch_idx * params.stride_V_batch +
                                             head_idx * params.stride_V_head +
-                                            global_col * params.stride_V_seq) / 2 + dim_idx / 2;
+                                            global_col * params.stride_V_seq + dim_idx / 2;
                         uint8_t v_byte = V_data[v_byte_offset];
 
                         thread_output[dim_idx] += weight * decode_fp4(v_byte, 0) * v_scale;
