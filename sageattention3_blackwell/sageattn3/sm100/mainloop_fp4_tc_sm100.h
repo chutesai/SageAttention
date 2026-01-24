@@ -277,50 +277,32 @@ struct CollectiveMainloopFwdSm100FP4TensorCore {
     // FP4 Decode Helpers - Optimized versions
     ///////////////////////////////////////////////////////////////////////////
 
-    // Standard decode for single nibble
+    // Standard decode for single nibble: value = (nibble - 7.5) * 0.8
     CUTLASS_DEVICE static float decode_fp4(uint8_t packed, int which) {
         uint8_t nibble = which ? (packed >> 4) : (packed & 0x0F);
         return (static_cast<float>(nibble) - 7.5f) * 0.8f;
     }
 
-    // Lookup table for FP4 decode (computed at compile time conceptually)
-    // LUT[i] = (i - 7.5) * 0.8 for i in [0, 15]
-    // Values: -6, -5.2, -4.4, -3.6, -2.8, -2.0, -1.2, -0.4, 0.4, 1.2, 2.0, 2.8, 3.6, 4.4, 5.2, 6.0
-    static constexpr float FP4_LUT[16] = {
-        -6.0f, -5.2f, -4.4f, -3.6f, -2.8f, -2.0f, -1.2f, -0.4f,
-         0.4f,  1.2f,  2.0f,  2.8f,  3.6f,  4.4f,  5.2f,  6.0f
-    };
-
-    // Decode using LUT - faster than arithmetic
-    CUTLASS_DEVICE static float decode_fp4_lut(uint8_t packed, int which) {
-        uint8_t nibble = which ? (packed >> 4) : (packed & 0x0F);
-        return FP4_LUT[nibble];
-    }
-
-    // Decode a full byte to 2 floats using LUT
-    CUTLASS_DEVICE static void decode_fp4_byte(uint8_t packed, float& out0, float& out1) {
-        out0 = FP4_LUT[packed & 0x0F];
-        out1 = FP4_LUT[packed >> 4];
+    // Fast decode from nibble value (no extraction needed)
+    CUTLASS_DEVICE static float decode_nibble(uint8_t nibble) {
+        return (static_cast<float>(nibble) - 7.5f) * 0.8f;
     }
 
     // Vectorized decode of 4 bytes (8 FP4 values) to 8 floats
+    // Uses vectorized loads and batch decoding for efficiency
     CUTLASS_DEVICE static void decode_fp4_vec4(
         uint32_t packed4,  // 4 packed bytes
         float out[8]
     ) {
-        uint8_t b0 = packed4 & 0xFF;
-        uint8_t b1 = (packed4 >> 8) & 0xFF;
-        uint8_t b2 = (packed4 >> 16) & 0xFF;
-        uint8_t b3 = (packed4 >> 24) & 0xFF;
-
-        out[0] = FP4_LUT[b0 & 0x0F];
-        out[1] = FP4_LUT[b0 >> 4];
-        out[2] = FP4_LUT[b1 & 0x0F];
-        out[3] = FP4_LUT[b1 >> 4];
-        out[4] = FP4_LUT[b2 & 0x0F];
-        out[5] = FP4_LUT[b2 >> 4];
-        out[6] = FP4_LUT[b3 & 0x0F];
-        out[7] = FP4_LUT[b3 >> 4];
+        // Extract all 8 nibbles
+        out[0] = decode_nibble((packed4 >> 0) & 0x0F);
+        out[1] = decode_nibble((packed4 >> 4) & 0x0F);
+        out[2] = decode_nibble((packed4 >> 8) & 0x0F);
+        out[3] = decode_nibble((packed4 >> 12) & 0x0F);
+        out[4] = decode_nibble((packed4 >> 16) & 0x0F);
+        out[5] = decode_nibble((packed4 >> 20) & 0x0F);
+        out[6] = decode_nibble((packed4 >> 24) & 0x0F);
+        out[7] = decode_nibble((packed4 >> 28) & 0x0F);
     }
 
     ///////////////////////////////////////////////////////////////////////////
