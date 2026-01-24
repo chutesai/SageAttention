@@ -60,7 +60,12 @@ def dequantize_fp4(packed, sf, block_size=16):
 def reference_attention(q, k, v, scale, is_causal=False):
     """PyTorch reference attention implementation."""
     # q, k, v: [batch, heads, seq, dim]
-    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    # Use bfloat16 for matmul to avoid cuBLAS issues with float32
+    q_bf = q.to(torch.bfloat16)
+    k_bf = k.to(torch.bfloat16)
+    v_bf = v.to(torch.bfloat16)
+
+    scores = torch.matmul(q_bf, k_bf.transpose(-2, -1)).float() * scale
 
     if is_causal:
         seq_len = q.size(-2)
@@ -68,7 +73,7 @@ def reference_attention(q, k, v, scale, is_causal=False):
         scores.masked_fill_(mask, float('-inf'))
 
     attn = torch.softmax(scores, dim=-1)
-    out = torch.matmul(attn, v)
+    out = torch.matmul(attn.to(torch.bfloat16), v_bf).float()
     return out
 
 def test_fp4_correctness():
